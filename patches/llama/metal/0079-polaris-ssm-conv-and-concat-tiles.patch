@@ -1,0 +1,347 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 5ac1fa635..869378fba 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -274,17 +274,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
+     char name[256];
+ 
+     const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+ 
+     // only the block types that are not a multiple of four bytes have an aligned variant
+     const bool align = props->needs_aligned_loads &&
+         (tsrc == GGML_TYPE_Q4_0 || tsrc == GGML_TYPE_Q5_0 || tsrc == GGML_TYPE_Q8_0);
+ 
+-    snprintf(base, 256, "kernel_concat_%s%s", ggml_type_name(tsrc), align ? "_al" : "");
++    // f32 concat in these hybrid layers is the SSM conv-input transpose, and the generic
++    // element walk costs 5.9 ms a dispatch for it: see kernel_concat_f32_t in quantize.metal,
++    // which is the same op through an LDS tile at 0.63 ms
++    const char * tiled = tsrc == GGML_TYPE_F32 ? "_t" : "";
++    snprintf(base, 256, "kernel_concat_%s%s%s", ggml_type_name(tsrc), align ? "_al" : "", tiled);
+     snprintf(name, 256, "%s", base);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+     }
+ 
+     return res;
+diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
+index c58e7aad4..2a304eb44 100644
+--- a/ggml/src/ggml-metal/kernels/quantize.metal
++++ b/ggml/src/ggml-metal/kernels/quantize.metal
+@@ -274,16 +274,157 @@ kernel void kernel_concat(
+         }
+ 
+         device T * y = (device T *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+ 
+         *y = *x;
+     }
+ }
+ 
++// The hybrid layers' SSM conv-input concat is dst[c][t] = (t < st) ? src0[c][t] : src1[t-st][c]
++// with dst contiguous along t and src1 contiguous along c: a 761 x 8192 f32 transpose plus the
++// three state frames, 24 dispatches per prefill.  kernel_concat walks i0 (tokens) per thread
++// with the lane axis on the token index, so each load is one word per 32 KB stride and the
++// dispatch costs 5.9 ms.  This walks a 32 x 32 LDS tile instead, lanes on the channel axis for
++// the read and on the token axis for the write: 0.63 ms, same output.
++//
++// The grid belongs to the host, so tiles are strided over the threadgroup count the encoder
++// picked - ne1/count when rows are batched into a 2D threadgroup, ne1*nc0 when one row is one
++// threadgroup.  Anything this does not describe (another concat dimension, a higher rank, or
++// strides that are not contiguous where it needs them) takes the shipped element walk.
++#define CAT_TT 32
++#define CAT_TC 32
++
++static inline void kernel_concat_f32_scalar(
++        constant ggml_metal_kargs_concat & args,
++        device  const char * src0,
++        device  const char * src1,
++        device        char * dst,
++        uint3   tgpig, ushort3 tpitg, ushort3 ntg) {
++
++    const int i3 = tgpig.z;
++    const int i2 = tgpig.y;
++    const int i1 = ntg.y == 1 ? tgpig.x/args.nc0 : tgpig.x*ntg.y + tpitg.y;
++    const int ic = ntg.y == 1 ? tgpig.x%args.nc0 : 0;
++
++    if (i1 >= args.ne1) {
++        return;
++    }
++
++    int o[4] = {0, 0, 0, 0};
++    o[args.dim] = args.dim == 0 ? args.ne00 : (args.dim == 1 ? args.ne01 : (args.dim == 2 ? args.ne02 : args.ne03));
++
++    const int n0  = (args.ne0 + args.nc0 - 1)/args.nc0;
++    const int i0e = min(args.ne0, (ic + 1)*n0);
++
++    for (int i0 = ic*n0 + tpitg.x; i0 < i0e; i0 += ntg.x) {
++        device const float * x;
++
++        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
++            x = (device const float *)(src0 + (i3       )*args.nb03 + (i2       )*args.nb02 + (i1       )*args.nb01 + (i0       )*args.nb00);
++        } else {
++            x = (device const float *)(src1 + (i3 - o[3])*args.nb13 + (i2 - o[2])*args.nb12 + (i1 - o[1])*args.nb11 + (i0 - o[0])*args.nb10);
++        }
++
++        device float * y = (device float *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
++
++        *y = *x;
++    }
++}
++
++static inline void kernel_concat_f32_tile(
++        constant ggml_metal_kargs_concat & args,
++        device  const char * src0,
++        device  const char * src1,
++        device        char * dst,
++        threadgroup float * tile,
++        int g, int tid, int nthreads) {
++
++    const int ntc  = (args.ne1 + CAT_TC - 1)/CAT_TC;
++    const int ct   = g % ntc;
++    const int tt   = g / ntc;
++    const int c0   = ct*CAT_TC;
++    const int t0   = tt*CAT_TT;
++    const int st   = args.ne00;              // state frames
++    const int nnew = args.ne0 - st;          // rows coming from src1
++
++    // read: lanes along the channel axis, the unit stride of src1
++    {
++        const int c  = tid % CAT_TC;
++        const int r  = tid / CAT_TC;
++        const int sc = nthreads/CAT_TC;
++        const int cg = c0 + c;
++        if (r < sc && cg < args.ne1) {
++            for (int t = r; t < CAT_TT; t += sc) {
++                const int tg = t0 + t;
++                if (tg >= args.ne0) break;
++                if (tg < st) {
++                    tile[c*(CAT_TT + 1) + t] = *(device const float *)(src0 + (uint64_t) cg*args.nb01
++                                                                      + (uint64_t) tg*args.nb00);
++                } else if (tg - st < nnew) {
++                    tile[c*(CAT_TT + 1) + t] = *(device const float *)(src1 + (uint64_t) cg*args.nb11
++                                                                      + (uint64_t) (tg - st)*args.nb10);
++                } else {
++                    break;
++                }
++            }
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // write: lanes along the token axis, the unit stride of dst
++    {
++        const int t   = tid % CAT_TT;
++        const int r   = tid / CAT_TT;
++        const int stw = nthreads/CAT_TT;
++        const int tg  = t0 + t;
++        if (r < stw && tg < args.ne0) {
++            for (int c = r; c < CAT_TC; c += stw) {
++                const int cg = c0 + c;
++                if (cg >= args.ne1) break;
++                *(device float *)(dst + (uint64_t) cg*args.nb1 + (uint64_t) tg*args.nb0) =
++                    tile[c*(CAT_TT + 1) + t];
++            }
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++}
++
++kernel void kernel_concat_f32_t(
++        constant ggml_metal_kargs_concat & args,
++        device  const char * src0,
++        device  const char * src1,
++        device        char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++
++    const bool fast = args.dim == 0 && args.ne2 == 1 && args.ne3 == 1 &&
++                      args.nb0 == 4 && args.nb11 == 4 && args.nb00 == 4;
++
++    if (!fast) {
++        kernel_concat_f32_scalar(args, src0, src1, dst, tgpig, tpitg, ntg);
++        return;
++    }
++
++    const int groups = ntg.y > 1 ? (args.ne1 + ntg.y - 1)/ntg.y
++                                 : args.ne1*max(1, args.nc0);
++    const int nthreads = ntg.x*ntg.y*ntg.z;
++    const int tid = tpitg.x + ntg.x*(tpitg.y + ntg.y*tpitg.z);
++
++    threadgroup float tile[CAT_TC*(CAT_TT + 1)];
++
++    const int ntiles = ((args.ne1 + CAT_TC - 1)/CAT_TC)*((args.ne0 + CAT_TT - 1)/CAT_TT);
++    for (int g = tgpig.x; g < ntiles; g += groups) {
++        kernel_concat_f32_tile(args, src0, src1, dst, tile, g, tid, nthreads);
++    }
++}
++
+ typedef decltype(kernel_concat<float>) kernel_concat_t;
+ 
+ template [[host_name("kernel_concat_f32")]]  kernel kernel_concat_t kernel_concat<float>;
+ template [[host_name("kernel_concat_f16")]]  kernel kernel_concat_t kernel_concat<half>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_concat_bf16")]] kernel kernel_concat_t kernel_concat<bfloat>;
+ #endif
+ template [[host_name("kernel_concat_i8")]]   kernel kernel_concat_t kernel_concat<char>;
+diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
+index 0001daaed..9a3d79bc7 100644
+--- a/ggml/src/ggml-metal/kernels/ssm.metal
++++ b/ggml/src/ggml-metal/kernels/ssm.metal
+@@ -236,59 +236,125 @@ kernel void kernel_ssm_conv_f32_f32_batched(
+     float sumf = 0.0f;
+     FOR_UNROLL (int64_t i0 = 0; i0 < nc; ++i0) {
+         sumf += s[i0] * c[i0];
+     }
+ 
+     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+ }
+ 
++// Two macros and the tiled body below are the only local additions to ssm.metal.
++#define SSM_CONV_TT 32   // tokens per tile
++#define SSM_CONV_TC 32   // channels per tile
++
+ kernel void kernel_ssm_conv_f32_f32_batched_4(
+         constant ggml_metal_kargs_ssm_conv & args,
+         device const  void * src0,
+         device const  void * src1,
+         device       float * dst,
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]]) {
+-    // tgpig.x = row index (ir)
+-    // tgpig.y = batch of tokens (i2_base / BATCH_SIZE)
+-    // tgpig.z = sequence index (i3)
+-    // tpitg.x = thread within batch (0..BATCH_SIZE-1)
+-    const short BATCH_SIZE = FC_ssm_conv_bs;
+-
+-    const int64_t ir      = tgpig.x;
+-    const int64_t i2_base = tgpig.y * BATCH_SIZE;
+-    const int64_t i3      = tgpig.z;
+-    const int64_t i2_off  = tpitg.x;
+-    const int64_t i2      = i2_base + i2_off;
+-
+-    const int64_t nc  = FC_ssm_conv_nc;  // conv kernel size (typically 4)
+-    const int64_t n_t = args.ne1;   // number of tokens
+-
+-    // Bounds check for partial batches at the end
+-    if (i2 >= n_t) {
++    // The conv input holds one channel's 4 taps in 16 contiguous bytes and the output is
++    // channel-major per token, so the shipped mapping (one token per thread, lanes on the token
++    // axis) puts every 4-byte store 32 KB away from its neighbour and pays 3.42 ms a dispatch,
++    // 24 dispatches per prefill.  This walks a 32 x 32 LDS tile instead: lanes on the token axis
++    // while it reads, with the dot and the silu folded in, lanes on the channel axis while it
++    // writes, so both sides move 128-byte lines.  In situ: 3.42 -> 0.76 ms, same sha.
++    const short   BATCH_SIZE = FC_ssm_conv_bs;
++    const int64_t nc         = FC_ssm_conv_nc;
++    const int     nch        = (int) args.ne0;
++    const int     n_t        = (int) args.ne1;
++
++    threadgroup float tile[SSM_CONV_TC*(SSM_CONV_TT + 1)];
++
++    if (nc != 4 || ntg.x < 32) {
++        // the shipped element walk, for any geometry the tiled path does not describe
++        const int64_t ir = tgpig.x;
++        const int64_t i2 = tgpig.y*BATCH_SIZE + tpitg.x;
++        const int64_t i3 = tgpig.z;
++        if (i2 >= n_t) {
++            return;
++        }
++        device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
++        device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
++        device       float  * x = (device       float  *) ((device       char *) dst  + ir*args.nb0  + i2*args.nb1  + i3*args.nb2);
++        float sumf = 0.0f;
++        for (int64_t i0 = 0; i0 < nc/4; ++i0) {
++            sumf += dot(s[i0], c[i0]);
++        }
++        x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+         return;
+     }
+ 
+-    // Load conv weights (shared across all tokens for this row)
+-    device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
++    // the encoder dispatched ne01 x ceil(ne1/BATCH_SIZE) threadgroups of BATCH_SIZE threads
++    const int i3       = (int) tgpig.z;
++    const int ngy      = (n_t + (int) ntg.x - 1)/(int) ntg.x;
++    const int nthreads = ntg.x*ntg.y*ntg.z;
++    // ngroups covers rows and token-batches only; the z-axis (sequences) is the grid's z-dim
++    const int ngroups  = (int) args.ne01*ngy;
++    const int gid      = tgpig.x + (int) args.ne01*tgpig.y;
++    const int tid      = tpitg.x + ntg.x*(tpitg.y + ntg.y*tpitg.z);
++    const int nwarp    = nthreads/32;
++    const int warp     = tid/32;
++    const int lane     = tid % 32;
++
++    const int ntc    = (nch + SSM_CONV_TC - 1)/SSM_CONV_TC;
++    const int ntiles = ntc*((n_t + SSM_CONV_TT - 1)/SSM_CONV_TT);
++
++    for (int g = gid; g < ntiles; g += ngroups) {
++        const int c0 = (g % ntc)*SSM_CONV_TC;
++        const int t0 = (g / ntc)*SSM_CONV_TT;
++
++        // read, dot and silu: lanes along the tokens, one 128-byte line per tap per warp
++        for (int c = warp; c < SSM_CONV_TC; c += nwarp) {
++            const int cg = c0 + c;
++            if (cg >= nch) {
++                break;
++            }
++            device const float * k = (device const float *)((device const char *) src1
++                                                            + (uint64_t) cg*args.nb11);
++            const float k0 = k[0], k1 = k[1], k2 = k[2], k3 = k[3];
++            for (int t = lane; t < SSM_CONV_TT; t += 32) {
++                const int tg = t0 + t;
++                if (tg >= n_t) {
++                    break;
++                }
++                device const float * s = (device const float *)((device const char *) src0
++                                                                + (uint64_t) cg*args.nb01
++                                                                + (uint64_t) tg*args.nb00
++                                                                + (uint64_t) i3*args.nb02);
++                const float sumf = s[0]*k0 + s[1]*k1 + s[2]*k2 + s[3]*k3;
++                tile[c*(SSM_CONV_TT + 1) + t] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
++            }
++        }
+ 
+-    // Load source for this specific token
+-    device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    // Output location for this token
+-    device float * x = (device float *) ((device char *) dst + ir*args.nb0 + i2*args.nb1 + i3*args.nb2);
++        // write: lanes along the channels, one 128-byte line per warp
++        for (int t = warp; t < SSM_CONV_TT; t += nwarp) {
++            const int tg = t0 + t;
++            if (tg >= n_t) {
++                break;
++            }
++            device float * row = (device float *)((device char *) dst
++                                                  + (uint64_t) tg*args.nb1
++                                                  + (uint64_t) i3*args.nb2);
++            for (int c = lane; c < SSM_CONV_TC; c += 32) {
++                const int cg = c0 + c;
++                if (cg >= nch) {
++                    break;
++                }
++                *(device float *)((device char *) row + (uint64_t) cg*args.nb0) =
++                    tile[c*(SSM_CONV_TT + 1) + t];
++            }
++        }
+ 
+-    float sumf = 0.0f;
+-    FOR_UNROLL (int64_t i0 = 0; i0 < nc/4; ++i0) {
+-        sumf += dot(s[i0], c[i0]);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+-
+-    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+ }
+ 
+ // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
+ // Optimized version: reduces redundant memory loads by having one thread load shared values
+ // TAIL == false is the whole-sequence / decode path: token_offset folds away at compile time.
+ template<bool TAIL>
+ kernel void kernel_ssm_scan_impl(
+         constant ggml_metal_kargs_ssm_scan & args,
