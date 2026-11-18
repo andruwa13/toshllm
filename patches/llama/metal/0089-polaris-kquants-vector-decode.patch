@@ -1,0 +1,279 @@
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
+index 2d112fc..f4eca9e 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
+@@ -441,22 +441,33 @@ void kernel_mul_mv_q6_K_f32_w64_wide_impl(
+         device const uint8_t * q1 = x[i].ql + q_offset_l;
+         device const uint8_t * q2 = q1 + 32;
+         device const uint8_t * qh = x[i].qh + q_offset_h;
+         device const int8_t  * sc = x[i].scales + is;
+         device const half    * dh = &x[i].d;
+ 
+         device const float * y = yy + i * QK_K + y_offset;
+ 
+-        for (short l = 0; l < 8; ++l) {
+-            yl[4*l + 0] = y[l +  0];
+-            yl[4*l + 1] = y[l + 32];
+-            yl[4*l + 2] = y[l + 64];
+-            yl[4*l + 3] = y[l + 96];
+-        }
++        const float4 ya0 = *(device const float4 *)(y +   0);
++        const float4 ya1 = *(device const float4 *)(y +   4);
++        const float4 yb0 = *(device const float4 *)(y +  32);
++        const float4 yb1 = *(device const float4 *)(y +  36);
++        const float4 yc0 = *(device const float4 *)(y +  64);
++        const float4 yc1 = *(device const float4 *)(y +  68);
++        const float4 yd0 = *(device const float4 *)(y +  96);
++        const float4 yd1 = *(device const float4 *)(y + 100);
++
++        yl[ 0] = ya0.x; yl[ 1] = yb0.x; yl[ 2] = yc0.x; yl[ 3] = yd0.x;
++        yl[ 4] = ya0.y; yl[ 5] = yb0.y; yl[ 6] = yc0.y; yl[ 7] = yd0.y;
++        yl[ 8] = ya0.z; yl[ 9] = yb0.z; yl[10] = yc0.z; yl[11] = yd0.z;
++        yl[12] = ya0.w; yl[13] = yb0.w; yl[14] = yc0.w; yl[15] = yd0.w;
++        yl[16] = ya1.x; yl[17] = yb1.x; yl[18] = yc1.x; yl[19] = yd1.x;
++        yl[20] = ya1.y; yl[21] = yb1.y; yl[22] = yc1.y; yl[23] = yd1.y;
++        yl[24] = ya1.z; yl[25] = yb1.z; yl[26] = yc1.z; yl[27] = yd1.z;
++        yl[28] = ya1.w; yl[29] = yb1.w; yl[30] = yc1.w; yl[31] = yd1.w;
+ 
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
+ 
+             // eight bytes land aligned whenever the row stride is a multiple of eight; the
+             // two-word fallback keeps the odd strides correct
+             uint2 w1, w2, wh;
+             if (FC_mul_mv_row8) {
+@@ -1847,22 +1858,25 @@ void kernel_mul_mv_q3_K_f32_w64_impl(
+     uint32_t scales32, aux32;
+     thread uint16_t * scales16 = (thread uint16_t *)&scales32;
+     thread const int8_t * scales = (thread const int8_t *)&scales32;
+ 
+     float sumf1[nr0] = {0.f};
+     float sumf2[nr0] = {0.f};
+ 
+     for (int i = bg; i < nb; i += ng) {
+-        for (short l = 0; l < 2; ++l) {
+-            yl[l+0] = y1[l+ 0];
+-            yl[l+2] = y1[l+16];
+-            yl[l+4] = y1[l+32];
+-            yl[l+6] = y1[l+48];
+-        }
++        const float2 ya = *(device const float2 *)(y1 +  0);
++        const float2 yb = *(device const float2 *)(y1 + 16);
++        const float2 yc = *(device const float2 *)(y1 + 32);
++        const float2 yd = *(device const float2 *)(y1 + 48);
++
++        yl[0] = ya.x; yl[1] = ya.y;
++        yl[2] = yb.x; yl[3] = yb.y;
++        yl[4] = yc.x; yl[5] = yc.y;
++        yl[6] = yd.x; yl[7] = yd.y;
+ 
+         // widen to int before the pointer math: short offsets into a device base miscompile on AMD
+         device const uint16_t * q = (device const uint16_t *)(x[i].qs + (int) q_offset);
+         device const uint16_t * h = (device const uint16_t *)(x[i].hmask + (int) l0);
+         device const uint16_t * a = (device const uint16_t *)(x[i].scales);
+         device const half * dh = &x[i].d;
+ 
+         for (short row = 0; row < nr0; ++row) {
+@@ -1987,23 +2001,43 @@ void kernel_mul_mv_q2_K_f32_w64_impl(
+     const short it = tiisg%8;  // 0...7
+     const short iq = it/4;     // 0 or 1
+     const short ir = it%4;     // 0...3
+     const short is = (8*ir)/16; // 0 or 1
+ 
+     device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+ 
+     for (int ib = ix; ib < nb; ib += nbi) {
+-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+-        for (short i = 0; i < 8; ++i) {
+-            yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+-            yl[i+ 8] = y4[i+32]; sumy[1] += yl[i+ 8];
+-            yl[i+16] = y4[i+64]; sumy[2] += yl[i+16];
+-            yl[i+24] = y4[i+96]; sumy[3] += yl[i+24];
+-        }
++        const float4 ya0 = *(device const float4 *)(y4 +   0);
++        const float4 ya1 = *(device const float4 *)(y4 +   4);
++        const float4 yb0 = *(device const float4 *)(y4 +  32);
++        const float4 yb1 = *(device const float4 *)(y4 +  36);
++        const float4 yc0 = *(device const float4 *)(y4 +  64);
++        const float4 yc1 = *(device const float4 *)(y4 +  68);
++        const float4 yd0 = *(device const float4 *)(y4 +  96);
++        const float4 yd1 = *(device const float4 *)(y4 + 100);
++
++        const float4 sum_ya = ya0 + ya1;
++        const float4 sum_yb = yb0 + yb1;
++        const float4 sum_yc = yc0 + yc1;
++        const float4 sum_yd = yd0 + yd1;
++
++        const float4 sumy = { sum_ya.x + sum_ya.y + sum_ya.z + sum_ya.w,
++                              sum_yb.x + sum_yb.y + sum_yb.z + sum_yb.w,
++                              sum_yc.x + sum_yc.y + sum_yc.z + sum_yc.w,
++                              sum_yd.x + sum_yd.y + sum_yd.z + sum_yd.w };
++
++        yl[ 0] = ya0.x; yl[ 1] = ya0.y; yl[ 2] = ya0.z; yl[ 3] = ya0.w;
++        yl[ 4] = ya1.x; yl[ 5] = ya1.y; yl[ 6] = ya1.z; yl[ 7] = ya1.w;
++        yl[ 8] = yb0.x; yl[ 9] = yb0.y; yl[10] = yb0.z; yl[11] = yb0.w;
++        yl[12] = yb1.x; yl[13] = yb1.y; yl[14] = yb1.z; yl[15] = yb1.w;
++        yl[16] = yc0.x; yl[17] = yc0.y; yl[18] = yc0.z; yl[19] = yc0.w;
++        yl[20] = yc1.x; yl[21] = yc1.y; yl[22] = yc1.z; yl[23] = yc1.w;
++        yl[24] = yd0.x; yl[25] = yd0.y; yl[26] = yd0.z; yl[27] = yd0.w;
++        yl[28] = yd1.x; yl[29] = yd1.y; yl[30] = yd1.z; yl[31] = yd1.w;
+ 
+         // widen to int before the pointer math: short offsets into a device base miscompile on AMD
+         device const uint8_t  * sc = (device const uint8_t  *)x[ib].scales + (8 * (int) iq + (int) is);
+         device const uint16_t * qs = (device const uint16_t *)x[ib].qs + (16 * (int) iq + 4 * (int) ir);
+         device const half     * dh = &x[ib].d;
+ 
+         for (short row = 0; row < nr0; row++) {
+             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+@@ -2098,22 +2132,37 @@ void kernel_mul_mv_q2_K_f32_L4_w64_impl(
+     const short it = tiisg%4;
+     const short iq = it/2;     // 0 or 1
+     const short ir = it%2;
+     const short is = (16*ir)/16; // 0 or 1
+ 
+     device const float * y4 = y + ix * QK_K + 128 * iq + 16 * ir;
+ 
+     for (int ib = ix; ib < nb; ib += nbi) {
+-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+-        for (short i = 0; i < 16; ++i) {
+-            yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+-            yl[i+16] = y4[i+32]; sumy[1] += yl[i+ 8];
+-            yl[i+32] = y4[i+64]; sumy[2] += yl[i+16];
+-            yl[i+48] = y4[i+96]; sumy[3] += yl[i+24];
++        device const float4 * ya = (device const float4 *)(y4 +   0);
++        device const float4 * yb = (device const float4 *)(y4 +  32);
++        device const float4 * yc = (device const float4 *)(y4 +  64);
++        device const float4 * yd = (device const float4 *)(y4 +  96);
++
++        const float4 sum_ya = ya[0] + ya[1] + ya[2] + ya[3];
++        const float4 sum_yb = yb[0] + yb[1] + yb[2] + yb[3];
++        const float4 sum_yc = yc[0] + yc[1] + yc[2] + yc[3];
++        const float4 sum_yd = yd[0] + yd[1] + yd[2] + yd[3];
++
++        const float4 sumy = { sum_ya.x + sum_ya.y + sum_ya.z + sum_ya.w,
++                              sum_yb.x + sum_yb.y + sum_yb.z + sum_yb.w,
++                              sum_yc.x + sum_yc.y + sum_yc.z + sum_yc.w,
++                              sum_yd.x + sum_yd.y + sum_yd.z + sum_yd.w };
++
++        #pragma unroll
++        for (short k = 0; k < 4; ++k) {
++            yl[4*k +  0] = ya[k].x; yl[4*k +  1] = ya[k].y; yl[4*k +  2] = ya[k].z; yl[4*k +  3] = ya[k].w;
++            yl[4*k + 16] = yb[k].x; yl[4*k + 17] = yb[k].y; yl[4*k + 18] = yb[k].z; yl[4*k + 19] = yb[k].w;
++            yl[4*k + 32] = yc[k].x; yl[4*k + 33] = yc[k].y; yl[4*k + 34] = yc[k].z; yl[4*k + 35] = yc[k].w;
++            yl[4*k + 48] = yd[k].x; yl[4*k + 49] = yd[k].y; yl[4*k + 50] = yd[k].z; yl[4*k + 51] = yd[k].w;
+         }
+ 
+         // widen to int before the pointer math: short offsets into a device base miscompile on AMD
+         device const uint8_t  * sc = (device const uint8_t  *)x[ib].scales + (8 * (int) iq + (int) is);
+         device const uint16_t * qs = (device const uint16_t *)x[ib].qs + (16 * (int) iq + 8 * (int) ir);
+         device const half     * dh = &x[ib].d;
+ 
+         for (short row = 0; row < nr0; row++) {
+@@ -2209,23 +2258,30 @@ void kernel_mul_mv_q2_K_f32_L16_w64_impl(
+     const short it = tiisg%16;
+     const short iq = it/8;     // 0 or 1
+     const short ir = it%8;
+     const short is = (4*ir)/16; // 0 or 1
+ 
+     device const float * y4 = y + ix * QK_K + 128 * iq + 4 * ir;
+ 
+     for (int ib = ix; ib < nb; ib += nbi) {
+-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+-        for (short i = 0; i < 4; ++i) {
+-            yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+-            yl[i+ 4] = y4[i+32]; sumy[1] += yl[i+ 8];
+-            yl[i+ 8] = y4[i+64]; sumy[2] += yl[i+16];
+-            yl[i+12] = y4[i+96]; sumy[3] += yl[i+24];
+-        }
++        const float4 ya = *(device const float4 *)(y4 +   0);
++        const float4 yb = *(device const float4 *)(y4 +  32);
++        const float4 yc = *(device const float4 *)(y4 +  64);
++        const float4 yd = *(device const float4 *)(y4 +  96);
++
++        const float4 sumy = { ya.x + ya.y + ya.z + ya.w,
++                              yb.x + yb.y + yb.z + yb.w,
++                              yc.x + yc.y + yc.z + yc.w,
++                              yd.x + yd.y + yd.z + yd.w };
++
++        yl[ 0] = ya.x; yl[ 1] = ya.y; yl[ 2] = ya.z; yl[ 3] = ya.w;
++        yl[ 4] = yb.x; yl[ 5] = yb.y; yl[ 6] = yb.z; yl[ 7] = yb.w;
++        yl[ 8] = yc.x; yl[ 9] = yc.y; yl[10] = yc.z; yl[11] = yc.w;
++        yl[12] = yd.x; yl[13] = yd.y; yl[14] = yd.z; yl[15] = yd.w;
+ 
+         // widen to int before the pointer math: short offsets into a device base miscompile on AMD
+         device const uint8_t  * sc = (device const uint8_t  *)x[ib].scales + (8 * (int) iq + (int) is);
+         device const uint16_t * qs = (device const uint16_t *)x[ib].qs + (16 * (int) iq + 2 * (int) ir);
+         device const half     * dh = &x[ib].d;
+ 
+         for (short row = 0; row < nr0; row++) {
+             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+@@ -2479,22 +2535,33 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
+         device const uint8_t * q1 = x[i].ql + q_offset_l;
+         device const uint8_t * q2 = q1 + 32;
+         device const uint8_t * qh = x[i].qh + q_offset_h;
+         device const int8_t  * sc = x[i].scales + is;
+         device const half    * dh = &x[i].d;
+ 
+         device const float * y = yy + i * QK_K + y_offset;
+ 
+-        for (short l = 0; l < 8; ++l) {
+-            yl[4*l + 0] = y[l +  0];
+-            yl[4*l + 1] = y[l + 32];
+-            yl[4*l + 2] = y[l + 64];
+-            yl[4*l + 3] = y[l + 96];
+-        }
++        const float4 ya0 = *(device const float4 *)(y +   0);
++        const float4 ya1 = *(device const float4 *)(y +   4);
++        const float4 yb0 = *(device const float4 *)(y +  32);
++        const float4 yb1 = *(device const float4 *)(y +  36);
++        const float4 yc0 = *(device const float4 *)(y +  64);
++        const float4 yc1 = *(device const float4 *)(y +  68);
++        const float4 yd0 = *(device const float4 *)(y +  96);
++        const float4 yd1 = *(device const float4 *)(y + 100);
++
++        yl[ 0] = ya0.x; yl[ 1] = yb0.x; yl[ 2] = yc0.x; yl[ 3] = yd0.x;
++        yl[ 4] = ya0.y; yl[ 5] = yb0.y; yl[ 6] = yc0.y; yl[ 7] = yd0.y;
++        yl[ 8] = ya0.z; yl[ 9] = yb0.z; yl[10] = yc0.z; yl[11] = yd0.z;
++        yl[12] = ya0.w; yl[13] = yb0.w; yl[14] = yc0.w; yl[15] = yd0.w;
++        yl[16] = ya1.x; yl[17] = yb1.x; yl[18] = yc1.x; yl[19] = yd1.x;
++        yl[20] = ya1.y; yl[21] = yb1.y; yl[22] = yc1.y; yl[23] = yd1.y;
++        yl[24] = ya1.z; yl[25] = yb1.z; yl[26] = yc1.z; yl[27] = yd1.z;
++        yl[28] = ya1.w; yl[29] = yb1.w; yl[30] = yc1.w; yl[31] = yd1.w;
+ 
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
+ 
+             // the block is 210 bytes, so every other one sits two bytes off a word and a
+             // card that requires natural alignment reads the wrong bytes; two shorts land
+             // right on every block, and one word is fine where the row stride allows it
+             uint w1 = 0, w2 = 0, wh = 0;
+@@ -2607,22 +2674,23 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
+         device const uint8_t * q1 = x[i].ql + q_offset_l;
+         device const uint8_t * q2 = q1 + 32;
+         device const uint8_t * qh = x[i].qh + q_offset_h;
+         device const int8_t  * sc = x[i].scales + is;
+         device const half    * dh = &x[i].d;
+ 
+         device const float * y = yy + i * QK_K + y_offset;
+ 
+-        for (short l = 0; l < 2; ++l) {
+-            yl[4*l + 0] = y[l +  0];
+-            yl[4*l + 1] = y[l + 32];
+-            yl[4*l + 2] = y[l + 64];
+-            yl[4*l + 3] = y[l + 96];
+-        }
++        const float2 ya = *(device const float2 *)(y +  0);
++        const float2 yb = *(device const float2 *)(y + 32);
++        const float2 yc = *(device const float2 *)(y + 64);
++        const float2 yd = *(device const float2 *)(y + 96);
++
++        yl[0] = ya.x; yl[1] = yb.x; yl[2] = yc.x; yl[3] = yd.x;
++        yl[4] = ya.y; yl[5] = yb.y; yl[6] = yc.y; yl[7] = yd.y;
+ 
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
+ 
+             // the block is 210 bytes, so every other one sits two bytes off a word and a
+             // card that requires natural alignment reads the wrong bytes; two shorts land
+             // right on every block, and one word is fine where the row stride allows it
+             uint w1 = 0, w2 = 0, wh = 0;
