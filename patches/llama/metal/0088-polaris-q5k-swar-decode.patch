@@ -1,0 +1,412 @@
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
+index 4783df7..2d112fc 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
+@@ -5315,19 +5315,16 @@ void kernel_mul_mv_q5_K_f32_w64_impl(
+     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+ 
+     device const block_q5_K * x = (device const block_q5_K *) (src0 + offset0);
+     device const float     * yy = (device const float      *) (src1 + offset1);
+ 
+     float sumf[nr0]={0.f};
+ 
+-    // four lanes per block: sixteen bytes each, so qs and qh arrive as one uint4
+-    float yl[32], yh[32];
+-
+     constexpr uint16_t kmask1 = 0x3f3f;
+     constexpr uint16_t kmask2 = 0x0f0f;
+     constexpr uint16_t kmask3 = 0xc0c0;
+ 
+     // 8 threads per block-group; scale the group count with the SIMD width so iq stays
+     // in {0,1} on wave64 (NG = 4 on wave32, 8 on wave64).
+     const short NG  = FC_mul_mv_nw/4;
+     const short tid = tiisg%4;
+@@ -5338,83 +5335,80 @@ void kernel_mul_mv_q5_K_f32_w64_impl(
+     const short l0 = 16*ir;
+     const short q_offset = 32*iq + l0;
+     const short y_offset = 64*iq + l0;
+ 
+     // pre-shifting qh by this puts the four bits this lane wants at fixed positions
+     // 0/1/4/5, so the masks below are constants and the selects become shifts
+     const ushort hsh = 2*iq;
+ 
+-    uint16_t sc16[4];
+-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+-
+     device const float * y1 = yy + ix*QK_K + y_offset;
+ 
+     // same header as q4_K: d, dmin and the 12 scales are the block's first 16 bytes, and 176
+     // keeps every row 16-byte aligned, so one load covers what was two halves and three shorts
+     const ushort shs = 16*iq;
+ 
+     for (int i = ix; i < nb; i += NG) {
++        device const float4 * ya = (device const float4 *)(y1 +   0);
++        device const float4 * yb = (device const float4 *)(y1 +  32);
++        device const float4 * yc = (device const float4 *)(y1 + 128);
++        device const float4 * yd = (device const float4 *)(y1 + 160);
++
++        const float4 sum_ya = ya[0] + ya[1] + ya[2] + ya[3];
++        const float4 sum_yb = yb[0] + yb[1] + yb[2] + yb[3];
++        const float4 sum_yc = yc[0] + yc[1] + yc[2] + yc[3];
++        const float4 sum_yd = yd[0] + yd[1] + yd[2] + yd[3];
++
++        const float4 sumy = { sum_ya.x + sum_ya.y + sum_ya.z + sum_ya.w,
++                              sum_yb.x + sum_yb.y + sum_yb.z + sum_yb.w,
++                              sum_yc.x + sum_yc.y + sum_yc.z + sum_yc.w,
++                              sum_yd.x + sum_yd.y + sum_yd.z + sum_yd.w };
++
+         device const uint8_t * q1 = x[i].qs + q_offset;
+         device const uint8_t * qh = x[i].qh + l0;
+-        device const uint4  * hp = (device const uint4 *) &x[i];
+-
+-        device const float * y2 = y1 + 128;
+-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+-        for (short l = 0; l < 16; ++l) {
+-            yl[l+ 0] = y1[l+ 0]; sumy[0] += yl[l+ 0];
+-            yl[l+16] = y1[l+32]; sumy[1] += yl[l+16];
+-            yh[l+ 0] = y2[l+ 0]; sumy[2] += yh[l+ 0];
+-            yh[l+16] = y2[l+32]; sumy[3] += yh[l+16];
+-        }
++        device const uint4   * hp = (device const uint4 *) &x[i];
+ 
+         for (short row = 0; row < nr0; ++row) {
+             device const uint8_t * q2 = q1 + 64;
+ 
+             const uint4  hdr = *hp;
+             const half2  dm  = as_type<half2>(hdr.x);
+ 
+             const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+             const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+             const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+ 
+-            sc16[0] = s0 & kmask1;
+-            sc16[1] = s2 & kmask1;
+-            sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+-            sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
++            const uchar2 sc01 = as_type<uchar2>((uint16_t)(s0 & kmask1));
++            const uchar2 sc23 = as_type<uchar2>((uint16_t)(s2 & kmask1));
++            const uchar2 sc45 = as_type<uchar2>((uint16_t)(((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2)));
++            const uchar2 sc67 = as_type<uchar2>((uint16_t)(((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2)));
+ 
+-            float4 acc1 = {0.f};
+-            // sixteen bytes per lane: one uint4 each where the 32-wide kernel needed two loads
+             const uint4 q1w = *(device const uint4 *)(q1);
+             const uint4 q2w = *(device const uint4 *)(q2);
+             const uint4 qhw = *(device const uint4 *)(qh);
+ 
++            float4 acc = {0.f};
+             FOR_UNROLL (short w = 0; w < 4; ++w) {
+-                const uchar4 qv1 = as_type<uchar4>(q1w[w]);
+-                const uchar4 qv2 = as_type<uchar4>(q2w[w]);
+-                const uchar4 qvh = as_type<uchar4>((qhw[w] >> hsh) & 0x33333333u);
+-
+-                FOR_UNROLL (short l = 0; l < 4; ++l) {
+-                    const short    o  = 4*w + l;
+-                    const uint8_t  h  = qvh[l];
+-                    const uint8_t  v1 = qv1[l];
+-                    const uint8_t  v2 = qv2[l];
+-
+-                    acc1[0] += yl[o+ 0] * (float) ((v1 & 0x0F) | ((h & 1) << 4));
+-                    acc1[1] += yl[o+16] * (float) ((v1 >>   4) | ((h & 2) << 3));
+-                    acc1[2] += yh[o+ 0] * (float) ((v2 & 0x0F) |  (h & 16));
+-                    acc1[3] += yh[o+16] * (float) ((v2 >>   4) | ((h & 32) >> 1));
+-                }
++                const uint qhw_w = qhw[w] >> hsh;
++                const uchar4 qv1_lo = as_type<uchar4>((q1w[w] & 0x0F0F0F0Fu) | ((qhw_w << 4) & 0x10101010u));
++                const uchar4 qv1_hi = as_type<uchar4>(((q1w[w] >> 4) & 0x0F0F0F0Fu) | ((qhw_w << 3) & 0x10101010u));
++                const uchar4 qv2_lo = as_type<uchar4>((q2w[w] & 0x0F0F0F0Fu) | (qhw_w & 0x10101010u));
++                const uchar4 qv2_hi = as_type<uchar4>(((q2w[w] >> 4) & 0x0F0F0F0Fu) | ((qhw_w >> 1) & 0x10101010u));
++
++                acc[0] += dot(ya[w], float4(qv1_lo));
++                acc[1] += dot(yb[w], float4(qv1_hi));
++                acc[2] += dot(yc[w], float4(qv2_lo));
++                acc[3] += dot(yd[w], float4(qv2_hi));
+             }
+ 
+-            sumf[row] += dm[0] * (sc8[0] * acc1[0] +
+-                                  sc8[1] * acc1[1] +
+-                                  sc8[4] * acc1[2] +
+-                                  sc8[5] * acc1[3]) -
+-                         dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
++            sumf[row] += dm[0] * (sc01.x * acc[0] +
++                                  sc01.y * acc[1] +
++                                  sc45.x * acc[2] +
++                                  sc45.y * acc[3]) -
++                         dm[1] * (sumy.x * sc23.x + sumy.y * sc23.y + sumy.z * sc67.x + sumy.w * sc67.y);
+ 
+             q1 += args.nb01;
+             qh += args.nb01;
+             hp  = (device const uint4 *) ((device const char *) hp + args.nb01);
+         }
+ 
+         y1 += NG * QK_K;
+     }
+@@ -5456,19 +5450,16 @@ void kernel_mul_mv_q5_K_f32_L8_w64_impl(
+     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+ 
+     device const block_q5_K * x = (device const block_q5_K *) (src0 + offset0);
+     device const float     * yy = (device const float      *) (src1 + offset1);
+ 
+     float sumf[nr0]={0.f};
+ 
+-    // four lanes per block: sixteen bytes each, so qs and qh arrive as one uint4
+-    float yl[16], yh[16];
+-
+     constexpr uint16_t kmask1 = 0x3f3f;
+     constexpr uint16_t kmask2 = 0x0f0f;
+     constexpr uint16_t kmask3 = 0xc0c0;
+ 
+     // 8 threads per block-group; scale the group count with the SIMD width so iq stays
+     // in {0,1} on wave64 (NG = 4 on wave32, 8 on wave64).
+     const short NG  = FC_mul_mv_nw/8;
+     const short tid = tiisg%8;
+@@ -5479,83 +5470,80 @@ void kernel_mul_mv_q5_K_f32_L8_w64_impl(
+     const short l0 = 8*ir;
+     const short q_offset = 32*iq + l0;
+     const short y_offset = 64*iq + l0;
+ 
+     // pre-shifting qh by this puts the four bits this lane wants at fixed positions
+     // 0/1/4/5, so the masks below are constants and the selects become shifts
+     const ushort hsh = 2*iq;
+ 
+-    uint16_t sc16[4];
+-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+-
+     device const float * y1 = yy + ix*QK_K + y_offset;
+ 
+     // same header as q4_K: d, dmin and the 12 scales are the block's first 16 bytes, and 176
+     // keeps every row 16-byte aligned, so one load covers what was two halves and three shorts
+     const ushort shs = 16*iq;
+ 
+     for (int i = ix; i < nb; i += NG) {
++        device const float4 * ya = (device const float4 *)(y1 +   0);
++        device const float4 * yb = (device const float4 *)(y1 +  32);
++        device const float4 * yc = (device const float4 *)(y1 + 128);
++        device const float4 * yd = (device const float4 *)(y1 + 160);
++
++        const float4 sum_ya = ya[0] + ya[1];
++        const float4 sum_yb = yb[0] + yb[1];
++        const float4 sum_yc = yc[0] + yc[1];
++        const float4 sum_yd = yd[0] + yd[1];
++
++        const float4 sumy = { sum_ya.x + sum_ya.y + sum_ya.z + sum_ya.w,
++                              sum_yb.x + sum_yb.y + sum_yb.z + sum_yb.w,
++                              sum_yc.x + sum_yc.y + sum_yc.z + sum_yc.w,
++                              sum_yd.x + sum_yd.y + sum_yd.z + sum_yd.w };
++
+         device const uint8_t * q1 = x[i].qs + q_offset;
+         device const uint8_t * qh = x[i].qh + l0;
+         device const uint4  * hp = (device const uint4 *) &x[i];
+ 
+-        device const float * y2 = y1 + 128;
+-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+-        for (short l = 0; l < 8; ++l) {
+-            yl[l+ 0] = y1[l+ 0]; sumy[0] += yl[l+ 0];
+-            yl[l+8] = y1[l+32]; sumy[1] += yl[l+8];
+-            yh[l+ 0] = y2[l+ 0]; sumy[2] += yh[l+ 0];
+-            yh[l+8] = y2[l+32]; sumy[3] += yh[l+8];
+-        }
+-
+         for (short row = 0; row < nr0; ++row) {
+             device const uint8_t * q2 = q1 + 64;
+ 
+             const uint4  hdr = *hp;
+             const half2  dm  = as_type<half2>(hdr.x);
+ 
+             const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+             const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+             const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+ 
+-            sc16[0] = s0 & kmask1;
+-            sc16[1] = s2 & kmask1;
+-            sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+-            sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
++            const uchar2 sc01 = as_type<uchar2>((uint16_t)(s0 & kmask1));
++            const uchar2 sc23 = as_type<uchar2>((uint16_t)(s2 & kmask1));
++            const uchar2 sc45 = as_type<uchar2>((uint16_t)(((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2)));
++            const uchar2 sc67 = as_type<uchar2>((uint16_t)(((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2)));
+ 
+-            float4 acc1 = {0.f};
+-            // sixteen bytes per lane: one uint4 each where the 32-wide kernel needed two loads
+             const uint2 q1w = *(device const uint2 *)(q1);
+             const uint2 q2w = *(device const uint2 *)(q2);
+             const uint2 qhw = *(device const uint2 *)(qh);
+ 
++            float4 acc = {0.f};
+             FOR_UNROLL (short w = 0; w < 2; ++w) {
+-                const uchar4 qv1 = as_type<uchar4>(q1w[w]);
+-                const uchar4 qv2 = as_type<uchar4>(q2w[w]);
+-                const uchar4 qvh = as_type<uchar4>((qhw[w] >> hsh) & 0x33333333u);
+-
+-                FOR_UNROLL (short l = 0; l < 4; ++l) {
+-                    const short    o  = 4*w + l;
+-                    const uint8_t  h  = qvh[l];
+-                    const uint8_t  v1 = qv1[l];
+-                    const uint8_t  v2 = qv2[l];
+-
+-                    acc1[0] += yl[o+ 0] * (float) ((v1 & 0x0F) | ((h & 1) << 4));
+-                    acc1[1] += yl[o+8] * (float) ((v1 >>   4) | ((h & 2) << 3));
+-                    acc1[2] += yh[o+ 0] * (float) ((v2 & 0x0F) |  (h & 16));
+-                    acc1[3] += yh[o+8] * (float) ((v2 >>   4) | ((h & 32) >> 1));
+-                }
++                const uint qhw_w = qhw[w] >> hsh;
++                const uchar4 qv1_lo = as_type<uchar4>((q1w[w] & 0x0F0F0F0Fu) | ((qhw_w << 4) & 0x10101010u));
++                const uchar4 qv1_hi = as_type<uchar4>(((q1w[w] >> 4) & 0x0F0F0F0Fu) | ((qhw_w << 3) & 0x10101010u));
++                const uchar4 qv2_lo = as_type<uchar4>((q2w[w] & 0x0F0F0F0Fu) | (qhw_w & 0x10101010u));
++                const uchar4 qv2_hi = as_type<uchar4>(((q2w[w] >> 4) & 0x0F0F0F0Fu) | ((qhw_w >> 1) & 0x10101010u));
++
++                acc[0] += dot(ya[w], float4(qv1_lo));
++                acc[1] += dot(yb[w], float4(qv1_hi));
++                acc[2] += dot(yc[w], float4(qv2_lo));
++                acc[3] += dot(yd[w], float4(qv2_hi));
+             }
+ 
+-            sumf[row] += dm[0] * (sc8[0] * acc1[0] +
+-                                  sc8[1] * acc1[1] +
+-                                  sc8[4] * acc1[2] +
+-                                  sc8[5] * acc1[3]) -
+-                         dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
++            sumf[row] += dm[0] * (sc01.x * acc[0] +
++                                  sc01.y * acc[1] +
++                                  sc45.x * acc[2] +
++                                  sc45.y * acc[3]) -
++                         dm[1] * (sumy.x * sc23.x + sumy.y * sc23.y + sumy.z * sc67.x + sumy.w * sc67.y);
+ 
+             q1 += args.nb01;
+             qh += args.nb01;
+             hp  = (device const uint4 *) ((device const char *) hp + args.nb01);
+         }
+ 
+         y1 += NG * QK_K;
+     }
+@@ -5597,19 +5585,16 @@ void kernel_mul_mv_q5_K_f32_L16_w64_impl(
+     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+ 
+     device const block_q5_K * x = (device const block_q5_K *) (src0 + offset0);
+     device const float     * yy = (device const float      *) (src1 + offset1);
+ 
+     float sumf[nr0]={0.f};
+ 
+-    // four lanes per block: sixteen bytes each, so qs and qh arrive as one uint4
+-    float yl[8], yh[8];
+-
+     constexpr uint16_t kmask1 = 0x3f3f;
+     constexpr uint16_t kmask2 = 0x0f0f;
+     constexpr uint16_t kmask3 = 0xc0c0;
+ 
+     // 8 threads per block-group; scale the group count with the SIMD width so iq stays
+     // in {0,1} on wave64 (NG = 4 on wave32, 8 on wave64).
+     const short NG  = FC_mul_mv_nw/16;
+     const short tid = tiisg%16;
+@@ -5620,83 +5605,63 @@ void kernel_mul_mv_q5_K_f32_L16_w64_impl(
+     const short l0 = 4*ir;
+     const short q_offset = 32*iq + l0;
+     const short y_offset = 64*iq + l0;
+ 
+     // pre-shifting qh by this puts the four bits this lane wants at fixed positions
+     // 0/1/4/5, so the masks below are constants and the selects become shifts
+     const ushort hsh = 2*iq;
+ 
+-    uint16_t sc16[4];
+-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+-
+     device const float * y1 = yy + ix*QK_K + y_offset;
+-
+     // same header as q4_K: d, dmin and the 12 scales are the block's first 16 bytes, and 176
+     // keeps every row 16-byte aligned, so one load covers what was two halves and three shorts
+     const ushort shs = 16*iq;
+ 
+     for (int i = ix; i < nb; i += NG) {
++        const float4 ya = *(device const float4 *)(y1 +   0);
++        const float4 yb = *(device const float4 *)(y1 +  32);
++        const float4 yc = *(device const float4 *)(y1 + 128);
++        const float4 yd = *(device const float4 *)(y1 + 160);
++
++        const float4 sumy = { ya.x + ya.y + ya.z + ya.w, yb.x + yb.y + yb.z + yb.w,
++                              yc.x + yc.y + yc.z + yc.w, yd.x + yd.y + yd.z + yd.w };
++
+         device const uint8_t * q1 = x[i].qs + q_offset;
+         device const uint8_t * qh = x[i].qh + l0;
+-        device const uint4  * hp = (device const uint4 *) &x[i];
+-
+-        device const float * y2 = y1 + 128;
+-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+-        for (short l = 0; l < 4; ++l) {
+-            yl[l+ 0] = y1[l+ 0]; sumy[0] += yl[l+ 0];
+-            yl[l+4] = y1[l+32]; sumy[1] += yl[l+4];
+-            yh[l+ 0] = y2[l+ 0]; sumy[2] += yh[l+ 0];
+-            yh[l+4] = y2[l+32]; sumy[3] += yh[l+4];
+-        }
++        device const uint4   * hp = (device const uint4 *) &x[i];
+ 
+         for (short row = 0; row < nr0; ++row) {
+             device const uint8_t * q2 = q1 + 64;
+ 
+             const uint4  hdr = *hp;
+             const half2  dm  = as_type<half2>(hdr.x);
+ 
+             const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+             const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+             const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+ 
+-            sc16[0] = s0 & kmask1;
+-            sc16[1] = s2 & kmask1;
+-            sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+-            sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
++            const uchar2 sc01 = as_type<uchar2>((uint16_t)(s0 & kmask1));
++            const uchar2 sc23 = as_type<uchar2>((uint16_t)(s2 & kmask1));
++            const uchar2 sc45 = as_type<uchar2>((uint16_t)(((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2)));
++            const uchar2 sc67 = as_type<uchar2>((uint16_t)(((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2)));
+ 
+-            float4 acc1 = {0.f};
+-            // sixteen bytes per lane: one uint4 each where the 32-wide kernel needed two loads
+             const uint q1w0 = *(device const uint *)(q1);
+             const uint q2w0 = *(device const uint *)(q2);
+-            const uint qhw0 = *(device const uint *)(qh);
+-
+-            FOR_UNROLL (short w = 0; w < 1; ++w) {
+-                const uchar4 qv1 = as_type<uchar4>(q1w0);
+-                const uchar4 qv2 = as_type<uchar4>(q2w0);
+-                const uchar4 qvh = as_type<uchar4>((qhw0 >> hsh) & 0x33333333u);
+-
+-                FOR_UNROLL (short l = 0; l < 4; ++l) {
+-                    const short    o  = 4*w + l;
+-                    const uint8_t  h  = qvh[l];
+-                    const uint8_t  v1 = qv1[l];
+-                    const uint8_t  v2 = qv2[l];
+-
+-                    acc1[0] += yl[o+ 0] * (float) ((v1 & 0x0F) | ((h & 1) << 4));
+-                    acc1[1] += yl[o+4] * (float) ((v1 >>   4) | ((h & 2) << 3));
+-                    acc1[2] += yh[o+ 0] * (float) ((v2 & 0x0F) |  (h & 16));
+-                    acc1[3] += yh[o+4] * (float) ((v2 >>   4) | ((h & 32) >> 1));
+-                }
+-            }
+-
+-            sumf[row] += dm[0] * (sc8[0] * acc1[0] +
+-                                  sc8[1] * acc1[1] +
+-                                  sc8[4] * acc1[2] +
+-                                  sc8[5] * acc1[3]) -
+-                         dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
++            const uint qhw  = (*(device const uint *)(qh)) >> hsh;
++
++            const uchar4 qv1_lo = as_type<uchar4>((q1w0 & 0x0F0F0F0Fu) | ((qhw << 4) & 0x10101010u));
++            const uchar4 qv1_hi = as_type<uchar4>(((q1w0 >> 4) & 0x0F0F0F0Fu) | ((qhw << 3) & 0x10101010u));
++            const uchar4 qv2_lo = as_type<uchar4>((q2w0 & 0x0F0F0F0Fu) | (qhw & 0x10101010u));
++            const uchar4 qv2_hi = as_type<uchar4>(((q2w0 >> 4) & 0x0F0F0F0Fu) | ((qhw >> 1) & 0x10101010u));
++
++            sumf[row] += dm[0] * (sc01.x * dot(ya, float4(qv1_lo)) +
++                                  sc01.y * dot(yb, float4(qv1_hi)) +
++                                  sc45.x * dot(yc, float4(qv2_lo)) +
++                                  sc45.y * dot(yd, float4(qv2_hi))) -
++                         dm[1] * (sumy.x * sc23.x + sumy.y * sc23.y + sumy.z * sc67.x + sumy.w * sc67.y);
+ 
+             q1 += args.nb01;
+             qh += args.nb01;
+             hp  = (device const uint4 *) ((device const char *) hp + args.nb01);
+         }
+ 
+         y1 += NG * QK_K;
+     }
