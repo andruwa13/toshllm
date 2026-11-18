@@ -1,0 +1,145 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 6ea92ba..d06ff89 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1955,16 +1955,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+                 if ((simd_width == 64 || TOSH_ENV("TOSH_MV_R8") != nullptr) && TOSH_ENV("TOSH_MV_R8_DISABLE") == nullptr) {
+                     nsg = 1;
+                     nr0 = 8;
+                     suffix = "_r8";
+                 } else {
+                     nsg = N_SG_Q2_K;
+                     nr0 = N_R0_Q2_K;
+                 }
++                // sixteen lanes per block with four rows per group: 14% to 41% off the decode
++                // matvec at every shape measured (248320 rows, 12288, 5120, 4096, 1024)
++                // TOSH_MV_Q2K_L16_DISABLE=1 restores the eight-row kernel
++                if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr &&
++                    TOSH_ENV("TOSH_MV_Q2K_L16_DISABLE") == nullptr) {
++                    nsg    = 1;
++                    nr0    = 4;
++                    suffix = "_L16r4";
++                }
+                 // the 64-lane twin of this kernel lives in mul_mv_w64.metal
+                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
+                     w64 = true;
+                 }
+             } break;
+         case GGML_TYPE_Q3_K:
+             {
+                 // A 64-lane variant with thirty-two lanes per block and the mask tables derived
+@@ -2068,16 +2077,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+                     } else {
+                         nr0 = 4;
+                         suffix = "_r4";
+                     }
+                 } else {
+                     nsg = N_SG_Q6_K;
+                     nr0 = N_R0_Q6_K;
+                 }
++                // thirty-two lanes per block, two bytes of each array per lane: 3% to 21% off the
++                // wide kernel at every shape from 4096 rows up (5% at the 248320-row output layer).
++                // Small matrices want four rows per group (35% at 1024 rows). The eight-lane
++                // variant is slower than the wide kernel everywhere above that, so it stays off.
++                // TOSH_MV_Q6K_L32_DISABLE=1 restores the wide kernel
++                if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr &&
++                    TOSH_ENV("TOSH_MV_Q6K_L32_DISABLE") == nullptr) {
++                    nsg    = 1;
++                    nr0    = ne01 <= 2048 ? 4 : 8;
++                    suffix = nr0 == 8 ? "_L32r8" : "_L32r4";
++                }
+                 // the 64-lane twin of this kernel lives in mul_mv_w64.metal
+                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
+                     w64 = true;
+                 }
+             } break;
+         case GGML_TYPE_IQ2_XXS:
+             {
+                 nsg = N_SG_IQ2_XXS;
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
+index f4eca9e..49a0dd4 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
+@@ -2508,18 +2508,17 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
+     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+ 
+     device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+     device const float     * yy = (device const float      *) (src1 + offset1);
+ 
+     float sumf[nr0] = { 0.f };
+ 
+-    // 16 lanes per block: four bytes per lane is what lets the three arrays be read
+-    // a word at a time, and it keeps four blocks in flight
++    // 8 lanes per block: eight bytes of each array per lane, read as two words
+     float yl[32];
+ 
+     // 16 threads per block-group; scale the group count with the SIMD width so ip stays
+     // in {0,1} on wave64 (NG = 2 on wave32, 4 on wave64).
+     const short NG  = FC_mul_mv_nw/8;
+     const short tid = tiisg%8;
+     const short ix  = tiisg/8;
+     const short ip  = tid/4;         // 0 or 1
+@@ -2576,19 +2575,22 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
+             } else if (FC_mul_mv_row4) {
+                 device const ushort * s1 = (device const ushort *) q1;
+                 device const ushort * s2 = (device const ushort *) q2;
+                 device const ushort * sh = (device const ushort *) qh;
+ 
+                 w1 = (uint) s1[0] | ((uint) s1[1] << 16);
+                 w2 = (uint) s2[0] | ((uint) s2[1] << 16);
+                 wh = (uint) sh[0] | ((uint) sh[1] << 16);
++                v1 = (uint) s1[2] | ((uint) s1[3] << 16);
++                v2 = (uint) s2[2] | ((uint) s2[3] << 16);
++                vh = (uint) sh[2] | ((uint) sh[3] << 16);
+             }
+ 
+-            FOR_UNROLL (short l = 0; l < 4; ++l) {
++            FOR_UNROLL (short l = 0; l < 8; ++l) {
+                 const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? w1 : v1) >> (8*(l&3))) : q1[l];
+                 const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? w2 : v2) >> (8*(l&3))) : q2[l];
+                 const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? wh : vh) >> (8*(l&3))) : qh[l];
+ 
+                 sums[0] += yl[4*l + 0] * ((int8_t)((b1 & 0xF) | ((bh & kmask1) << 4)) - 32);
+                 sums[1] += yl[4*l + 1] * ((int8_t)((b2 & 0xF) | ((bh & kmask2) << 2)) - 32);
+                 sums[2] += yl[4*l + 2] * ((int8_t)((b1  >> 4) | ((bh & kmask3) << 0)) - 32);
+                 sums[3] += yl[4*l + 3] * ((int8_t)((b2  >> 4) | ((bh & kmask4) >> 2)) - 32);
+@@ -2647,18 +2649,17 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
+     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+ 
+     device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+     device const float     * yy = (device const float      *) (src1 + offset1);
+ 
+     float sumf[nr0] = { 0.f };
+ 
+-    // 16 lanes per block: four bytes per lane is what lets the three arrays be read
+-    // a word at a time, and it keeps four blocks in flight
++    // 32 lanes per block: two bytes of each array per lane, one short
+     float yl[8];
+ 
+     // 16 threads per block-group; scale the group count with the SIMD width so ip stays
+     // in {0,1} on wave64 (NG = 2 on wave32, 4 on wave64).
+     const short NG  = FC_mul_mv_nw/32;
+     const short tid = tiisg%32;
+     const short ix  = tiisg/32;
+     const short ip  = tid/16;         // 0 or 1
+@@ -2699,17 +2700,17 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
+                 device const ushort * s2 = (device const ushort *) q2;
+                 device const ushort * sh = (device const ushort *) qh;
+ 
+                 w1 = (uint) s1[0];
+                 w2 = (uint) s2[0];
+                 wh = (uint) sh[0];
+             }
+ 
+-            FOR_UNROLL (short l = 0; l < 4; ++l) {
++            FOR_UNROLL (short l = 0; l < 2; ++l) {
+                 const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w1 >> (8*l)) : q1[l];
+                 const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w2 >> (8*l)) : q2[l];
+                 const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(wh >> (8*l)) : qh[l];
+ 
+                 sums[0] += yl[4*l + 0] * ((int8_t)((b1 & 0xF) | ((bh & kmask1) << 4)) - 32);
+                 sums[1] += yl[4*l + 1] * ((int8_t)((b2 & 0xF) | ((bh & kmask2) << 2)) - 32);
+                 sums[2] += yl[4*l + 2] * ((int8_t)((b1  >> 4) | ((bh & kmask3) << 0)) - 32);
+                 sums[3] += yl[4*l + 3] * ((int8_t)((b2  >> 4) | ((bh & kmask4) >> 2)) - 32);
