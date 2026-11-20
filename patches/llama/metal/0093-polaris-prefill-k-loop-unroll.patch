@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index ea9447a..6d5f19b 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -402,7 +402,7 @@ kernel void kernel_mul_mm(
+                 vec<float,2> pacc[NLR][4];
+                 for (short rr = 0; rr < NLR; rr++) { for (short cc = 0; cc < 4; cc++) { pacc[rr][cc] = 0; } }
+ 
+-                for (short ik = 0; ik < NK/8; ik++) {
++                FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                     FOR_UNROLL (short k = 0; k < 8; k += 2) {
+                         vec<S0,2> av[NLR];
+                         vec<S1,2> bv[4];
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm_w64.metal b/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
+index 29e5eb7..e007be1 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
+@@ -1096,7 +1096,7 @@ static inline void mw_tile(
+             mw_load_b(abase, args.nb11, r1, (i + 1)*MW_KT, bcol0, bkg, ne1, bq);
+         }
+ 
+-        #pragma unroll
++        #pragma unroll 8
+         for (int k = 0; k < MW_KT; k++) {
+             const vec<float, 8> av = *(threadgroup const vec<float, 8> *) (sa + k*64 + row0);
+             #pragma unroll
