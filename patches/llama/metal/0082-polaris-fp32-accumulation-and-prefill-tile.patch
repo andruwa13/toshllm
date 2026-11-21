@@ -1,13 +1,8 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index fb2627614..6f9473230 100644
+index 050c6f1..2e1f8ec 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -1244,17 +1244,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
-             default: break;
-         }
-     }
-     const bool narrow = use_mm_manual && !has_tensor && tsrc1 == GGML_TYPE_F32 &&
-                         (op->ne[1] <= 32 || tail_32);
+@@ -1297,7 +1297,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
  
      // wave64 wants a far higher floor: between 288 and 384 the tile loses on two models,
      // and from 448 up it wins 4 to 6%
@@ -17,17 +12,7 @@ index fb2627614..6f9473230 100644
      const bool wide_width_ok = simd_width != 64 || TOSH_ENV("TOSH_MM_WIDE_W64_DISABLE") == nullptr;
      // Both floors were derived against the 32-lane tile. The 64-lane rewrite moved the
      // crossover, and it moved by a different amount per type, so each carries its own:
-     // a single number would have to pick whom to hurt (q8_0 gains 3.7% where q4_K loses 3.1%).
-     // Types with no measurement of their own keep the width default.
-     int wide_floor = wide_floor_env ? wide_floor_env : (simd_width == 64 ? 448 : 112);
-     if (!wide_floor_env && simd_width == 64) {
-         switch (tsrc0) {
-@@ -1337,56 +1338,95 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
-                 wide = op->ne[0] >= wide_ext_floor && TOSH_ENV("TOSH_MM_WIDE_EXT_DISABLE") == nullptr; break;
-             // f32 has never been through this gate; the override opens it so the exclusion can
-             // be measured instead of inherited
-             default: wide = TOSH_ENV("TOSH_MM_WIDE_ALL") != nullptr && op->ne[0] >= wide_ext_floor; break;
-         }
+@@ -1391,11 +1392,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
      }
  
      // attention matmuls read a permuted KV cache view and can exceed half range in the packed
@@ -36,7 +21,6 @@ index fb2627614..6f9473230 100644
 -                         (!ggml_is_contiguous(op->src[0]) ||
 -                          ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT ||
 -                          (tsrc0 == GGML_TYPE_BF16 && TOSH_ENV("TOSH_MM_BF16_ACC_F32") != nullptr)) &&
--                         TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 +    // accumulator; bfloat has no native arithmetic here, so float is faster for it too.
 +    // gfx803 has no packed half arithmetic at all, so the half accumulator was costing a pair of
 +    // converts around every product: float is now the default here (11.3 -> 10.3 s prefill at
@@ -44,16 +28,14 @@ index fb2627614..6f9473230 100644
 +    // gfx803 has no packed half arithmetic at all, so the half accumulator was costing a pair of
 +    // converts around every product: float is default on Polaris (props->needs_aligned_loads)
 +    // while Vega and RDNA preserve their native packed half arithmetic.
-+    const bool acc_f32 = props->needs_aligned_loads && TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
++    const bool acc_f32 = (props->needs_aligned_loads ||
++                          (use_mm_manual && (!ggml_is_contiguous(op->src[0]) ||
++                                             ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT ||
++                                             (tsrc0 == GGML_TYPE_BF16 && TOSH_ENV("TOSH_MM_BF16_ACC_F32") != nullptr)))) &&
+                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
  
      // the 64-lane GEMM lives in mul_mm_w64.metal: one wave is one tile there, so it needs the
-     // dispatch to hand it whole waves instead of the 32-thread groups the shared kernel expects
-     // iq4_nl is the one type this kernel does not suit at every batch: it costs 3.9% at 256
-     // tokens and gains 1.0% at 512, so it takes a floor rather than lose the gain.
-     static const int w64_floor_env = []() {
-         const char * s = TOSH_ENV("TOSH_MM_W64_FLOOR");
-         return s ? atoi(s) : 0;
-     }();
+@@ -1409,10 +1416,44 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
      const int w64_floor = w64_floor_env ? w64_floor_env :
                            (tsrc0 == GGML_TYPE_IQ4_NL ? 384 : 0);
  
@@ -77,20 +59,28 @@ index fb2627614..6f9473230 100644
 +    // two 256-row SSM projections to the base 32-lane kernel, at 0.07 to 0.97 TF/s in the 10.7
 +    // profile against 0.55 to 1.51 for this tile at the same shapes. Only the row floor is
 +    // dropped; the token floor, the type gates and the byte gates below all still apply.
++    static const int mw_floor = []() {
++        const char * s = TOSH_ENV("TOSH_MM_MW_FLOOR");
++        return s ? atoi(s) : 64;
++    }();
 +    const bool mw_rows = use_mm_manual && !has_tensor && !wide && op->ne[0] >= 32 &&
-+                         op->ne[1] >= wide_floor && !bc_inp &&
++                         op->ne[1] >= mw_floor && !bc_inp &&
 +                         TOSH_ENV("TOSH_MM_MW_ROWS_DISABLE") == nullptr;
 +    const bool mw = simd_width == 64 && use_mm_manual && !has_tensor && (wide || mw_rows) && !w64 &&
 +                    (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) &&
 +                    tsrc1 == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
 +                    !bc_inp && op->src[0]->ne[0] % 256 == 0 &&
-+                    (tsrc0 != GGML_TYPE_Q4_K || op->src[0]->nb[1] % 16 == 0) &&
++                    op->src[1]->nb[0] == sizeof(float) &&
++                    op->src[1]->nb[1] % 16 == 0 && op->src[1]->nb[2] % 16 == 0 && op->src[1]->nb[3] % 16 == 0 &&
++                    (tsrc0 != GGML_TYPE_Q4_K || (op->src[0]->nb[1] % 16 == 0 &&
++                                                 op->src[0]->nb[2] % 16 == 0 &&
++                                                 op->src[0]->nb[3] % 16 == 0)) &&
 +                    TOSH_ENV("TOSH_MM_MW_DISABLE") == nullptr;
 +
      // a gradient can pass the half range: its f32 operand goes through the bfloat tile instead
      const bool grad_bf16 = acc_f32 && !w64 && ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT &&
                             ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat &&
-                            tsrc1 == GGML_TYPE_F32 && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16) &&
+@@ -1420,8 +1458,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
                             !(wide && tsrc0 == GGML_TYPE_F32) &&
                             TOSH_ENV("TOSH_MM_GRAD_BF16_DISABLE") == nullptr;
  
@@ -105,9 +95,7 @@ index fb2627614..6f9473230 100644
      // measured on 32 lanes only; the 64-lane tile lives in its own kernel
      const bool uniform_scale = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K) && wide && !w64 &&
                                 use_mm_manual && !has_tensor && simd_width == 32 &&
-                                TOSH_ENV("TOSH_MM_UNIFORM_SCALE_DISABLE") == nullptr;
- 
-     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_mm=%d_db=%d_af=%d_us=%d",
+@@ -1431,6 +1473,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
               base, bc_inp, bc_out, ne12, ne13, r2, r3, use_mm_manual + 2*narrow, use_mm_double_buffer, acc_f32, uniform_scale);
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -121,17 +109,7 @@ index fb2627614..6f9473230 100644
      if (!res.pipeline) {
          ggml_metal_cv_t cv = ggml_metal_cv_init();
  
-         ggml_metal_cv_set_bool(cv, narrow, FC_MUL_MM + 7);
-         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
-         ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
-         ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
-         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
-@@ -1403,16 +1443,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
-     }
- 
-     if (has_tensor) {
-         res.nr0 = NRA;
-         res.nr1 = NRB;
+@@ -1457,6 +1506,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
  
          const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
          res.smem = smem_a;
@@ -147,17 +125,7 @@ index fb2627614..6f9473230 100644
      } else {
          res.nr0 = 64;
          res.nr1 = use_mm_manual ? (narrow ? 32 : 64) : 32;
- 
-         res.smem = use_mm_double_buffer ? 16384 : ((bc_out || use_mm_manual) ? 8192 : (4096 + 2048));
-     }
- 
-     res.nsg = (!has_tensor && use_mm_manual) ? ((wide || narrow) ? 4 : 8) : N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
-@@ -2266,17 +2315,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
-     // per expert, +2.3% at 45)
-     static const int wide_floor = []() {
-         const char * s = TOSH_ENV("TOSH_MMID_WIDE_FLOOR");
-         return s ? atoi(s) : 32;
-     }();
+@@ -2297,7 +2355,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
  
      // wave64 is off by the dense tile's result, not by one measured here: the expert path splits
      // its work per expert, so the opt-in exists for a GCN card to settle it
@@ -167,21 +135,11 @@ index fb2627614..6f9473230 100644
      const bool wide_width_ok = simd_width != 64 || TOSH_ENV("TOSH_MMID_WIDE_W64_ENABLE") != nullptr;
  
      const int64_t tpe = op->src[0]->ne[2] > 0 ? op->src[2]->ne[0]*op->src[2]->ne[1] / op->src[0]->ne[2] : 0;
- 
-     bool wide = use_mm_manual && tsrc1 == GGML_TYPE_F32 && wide_width_ok &&
-                 tpe >= wide_floor && TOSH_ENV("TOSH_MMID_WIDE_DISABLE") == nullptr;
-     if (wide) {
-         // it needs 64 accumulators, so only where the dequant leaves the registers
 diff --git a/ggml/src/ggml-metal/kernels/mul_mm_w64.metal b/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
-index 3251bb605..29e5eb73f 100644
+index 3251bb6..29e5eb7 100644
 --- a/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
 +++ b/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
-@@ -17,45 +17,73 @@ constant short FC_mul_mm_ne12          [[function_constant(FC_MUL_MM + 2)]];
- constant short FC_mul_mm_ne13          [[function_constant(FC_MUL_MM + 3)]];
- constant short FC_mul_mm_r2            [[function_constant(FC_MUL_MM + 4)]];
- constant short FC_mul_mm_r3            [[function_constant(FC_MUL_MM + 5)]];
- constant bool  FC_mul_mm_manual        [[function_constant(FC_MUL_MM + 6)]];
- constant bool  FC_mul_mm_narrow        [[function_constant(FC_MUL_MM + 7)]];
+@@ -22,6 +22,11 @@ constant bool  FC_mul_mm_narrow        [[function_constant(FC_MUL_MM + 7)]];
  constant bool  FC_mul_mm_double_buffer [[function_constant(FC_MUL_MM + 8)]];
  constant bool  FC_mul_mm_acc_f32       [[function_constant(FC_MUL_MM + 9)]];
  
@@ -193,14 +151,7 @@ index 3251bb605..29e5eb73f 100644
  // NLR rows and NCC columns of the output per lane. NCC 4 with 8 lanes per row block gives a
  // wave 32 columns, which is what keeps the accumulator count equal to the 32-lane path.
  template<
-     typename S0, typename S0_4x4, typename S0_8x8,
-     typename S1, typename S1_2x4, typename S1_8x8,
-     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
-     typename T0, typename T0_4x4, typename T1, typename T1_2x4, short NLR = 4>
- kernel void kernel_mul_mm_w64(
-         constant ggml_metal_kargs_mul_mm & args,
-         device const char * src0,
-         device const char * src1,
+@@ -36,6 +41,7 @@ kernel void kernel_mul_mm_w64(
          device       char * dst,
          threadgroup  char * shmem [[threadgroup(0)]],
          uint3  tgpig[[threadgroup_position_in_grid]],
@@ -208,13 +159,7 @@ index 3251bb605..29e5eb73f 100644
          ushort tiitg[[thread_index_in_threadgroup]],
          ushort sgitg[[simdgroup_index_in_threadgroup]]) {
  
-     constexpr int NR0 = 64;
-     constexpr short NCC = 4;
- 
-     const int NR1 = FC_mul_mm_narrow ? 32 : 64;
- 
-     constexpr int NK  = 32;
-     constexpr int NL0 = NK/16;
+@@ -49,8 +55,30 @@ kernel void kernel_mul_mm_w64(
      constexpr int NL1 = NK/8;
  
      const int im = tgpig.z;
@@ -247,17 +192,7 @@ index 3251bb605..29e5eb73f 100644
  
      const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
      const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
- 
-     // a thread shouldn't load data outside of the matrix
-     const short lr0  = ((short)tiitg/NL0)       < nr0 ? ((short)tiitg/NL0)       : nr0 - 1;
-     const short lr1  = ((short)tiitg/NL1)       < nr1 ? ((short)tiitg/NL1)       : nr1 - 1;
-     const short lr1b = ((short)tiitg/NL1 + 32)  < nr1 ? ((short)tiitg/NL1 + 32)  : nr1 - 1;
-@@ -753,8 +781,370 @@ template [[host_name("kernel_mul_mm_id_iq2_xs_f16_w64")]]  kernel mul_mm_id_w64_
- template [[host_name("kernel_mul_mm_id_iq3_xxs_f16_w64")]] kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float,  float4x4,  half, half2x4>;
- template [[host_name("kernel_mul_mm_id_iq3_s_f16_w64")]]   kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq3_s,   QK_NL, dequantize_iq3_s,   float,  float4x4,  half, half2x4>;
- template [[host_name("kernel_mul_mm_id_iq2_s_f16_w64")]]   kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq2_s,   QK_NL, dequantize_iq2_s,   float,  float4x4,  half, half2x4>;
- template [[host_name("kernel_mul_mm_id_iq1_s_f16_w64")]]   kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_s,   QK_NL, dequantize_iq1_s,   float,  float4x4,  half, half2x4>;
- template [[host_name("kernel_mul_mm_id_iq1_m_f16_w64")]]   kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq1_m,   QK_NL, dequantize_iq1_m,   float,  float4x4,  half, half2x4>;
+@@ -758,3 +786,365 @@ template [[host_name("kernel_mul_mm_id_iq1_m_f16_w64")]]   kernel mul_mm_id_w64_
  template [[host_name("kernel_mul_mm_id_iq4_nl_f16_w64")]]  kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
  template [[host_name("kernel_mul_mm_id_iq4_xs_f16_w64")]]  kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
  template [[host_name("kernel_mul_mm_id_tq2_0_f16_w64")]]   kernel mul_mm_id_w64_t kernel_mul_mm_id_w64<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
