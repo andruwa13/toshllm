@@ -1,0 +1,79 @@
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm_w64.metal b/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
+index e007be1..ab5c68c 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm_w64.metal
+@@ -1051,8 +1051,9 @@ static inline void mw_tile(
+     device const char * abase = src1 + (uint64_t) args.nb13*i13 + (uint64_t) args.nb12*i12;
+ 
+     const int lane  = tiitg;
+-    const int row0  = 8*(lane >> 3);
+-    const int col0  = MW_NCOLS*(lane & 7);
++    const int tx    = lane & 7;
++    const int ty    = lane >> 3;
++    const int row0  = 8*ty;
+     const int bkg   = 4*(lane & (MW_KGRP - 1));
+     const int bcol0 = lane / MW_KGRP;
+ 
+@@ -1099,19 +1100,22 @@ static inline void mw_tile(
+         #pragma unroll 8
+         for (int k = 0; k < MW_KT; k++) {
+             const vec<float, 8> av = *(threadgroup const vec<float, 8> *) (sa + k*64 + row0);
+-            #pragma unroll
+-            for (int g = 0; g < MW_NCOLS/4; g++) {
+-                const float4 b = *(threadgroup const float4 *) (sb + k*MW_TW + col0 + 4*g);
+-                acc[4*g + 0] += av*b.x;
+-                acc[4*g + 1] += av*b.y;
+-                acc[4*g + 2] += av*b.z;
+-                acc[4*g + 3] += av*b.w;
+-            }
++            const float4 b0 = *(threadgroup const float4 *) (sb + k*MW_TW + 4*tx);
++            const float4 b1 = *(threadgroup const float4 *) (sb + k*MW_TW + 4*tx + 32);
++
++            acc[0] += av * b0.x;
++            acc[1] += av * b0.y;
++            acc[2] += av * b0.z;
++            acc[3] += av * b0.w;
++            acc[4] += av * b1.x;
++            acc[5] += av * b1.y;
++            acc[6] += av * b1.z;
++            acc[7] += av * b1.w;
+         }
+ 
+         if (more) {
+-            simdgroup_barrier(mem_flags::mem_threadgroup);
+             if (SP) mw_decode_a4(rawH, rawV, (i + 1)*MW_KT, rowok, dsc, dbia, qa);
++            simdgroup_barrier(mem_flags::mem_threadgroup);
+             mw_store_a(sa, qa, lane, dsc, dbia);
+             mw_store_b(sb, bq, bkg, bcol0);
+             simdgroup_barrier(mem_flags::mem_threadgroup);
+@@ -1120,18 +1124,24 @@ static inline void mw_tile(
+ 
+     device float * D = (device float *) dst + (int64_t) im*ne1*ne0 + r0;
+     #pragma unroll
+-    for (int c = 0; c < MW_NCOLS; c++) {
+-        const int col = r1 + col0 + c;
+-        if (col >= ne1) continue;
++    for (int g = 0; g < 2; g++) {
++        const int col_base = r1 + 4*tx + 32*g;
+         #pragma unroll
+-        for (int r = 0; r < 8; r++) {
+-            const int row = row0 + r;
+-            if (r0 + row < ne0) D[row + (int64_t) col*ne0] = acc[c][r];
++        for (int j = 0; j < 4; j++) {
++            const int col = col_base + j;
++            if (col >= ne1) continue;
++            const int c_acc = 4*g + j;
++            #pragma unroll
++            for (int r = 0; r < 8; r++) {
++                const int row = row0 + r;
++                if (r0 + row < ne0) D[row + (int64_t) col*ne0] = acc[c_acc][r];
++            }
+         }
+     }
+ }
+ 
+ #define MW_KERNEL(NAME, QT)                                                         \
++[[max_total_threads_per_threadgroup(64)]]                                           \
+ kernel void NAME(                                                                   \
+         constant ggml_metal_kargs_mul_mm & args,                                    \
+         device const char * src0,                                                   \
