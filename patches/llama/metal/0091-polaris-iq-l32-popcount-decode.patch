@@ -1,50 +1,44 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index d06ff89..66b58d2 100644
+index c7e3d52..d1fe6fa 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -2097,62 +2097,74 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
-                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
-                     w64 = true;
-                 }
-             } break;
-         case GGML_TYPE_IQ2_XXS:
+@@ -2116,21 +2116,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
              {
                  nsg = N_SG_IQ2_XXS;
                  nr0 = N_R0_IQ2_XXS;
 -                smem = 256*8+128;
-+                smem = 256*8;
-                 // the 64-lane twin of this kernel lives in mul_mv_w64.metal
-                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
-                     w64 = true;
-                 }
+-                // the 64-lane twin of this kernel lives in mul_mv_w64.metal
+-                if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
+-                    w64 = true;
+-                }
++                w64 = (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr);
++                smem = w64 ? (256*8) : (256*8 + 128);
              } break;
          case GGML_TYPE_IQ2_XS:
              {
                  nsg = N_SG_IQ2_XS;
                  nr0 = N_R0_IQ2_XS;
 -                smem = 512*8+128;
-+                smem = 512*8;
-                 // the 64-lane twin of this kernel lives in mul_mv_w64.metal
-                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
-                     w64 = true;
-                 }
+-                // the 64-lane twin of this kernel lives in mul_mv_w64.metal
+-                if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
+-                    w64 = true;
+-                }
++                w64 = (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr);
++                smem = w64 ? (512*8) : (512*8 + 128);
              } break;
          case GGML_TYPE_IQ3_XXS:
              {
-                 if ((simd_width == 64 || TOSH_ENV("TOSH_MV_R8") != nullptr) && TOSH_ENV("TOSH_MV_R8_DISABLE") == nullptr) {
-                     nsg = 1;
-                     nr0 = 8;
-                     suffix = "_r8";
-                 } else {
+@@ -2142,16 +2136,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                      nsg = N_SG_IQ3_XXS;
                      nr0 = N_R0_IQ3_XXS;
                  }
 -                smem = 256*4+128;
-+                smem = 256*4;
-                 // the 64-lane twin of this kernel lives in mul_mv_w64.metal
-                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
-                     w64 = true;
-                 }
+-                // the 64-lane twin of this kernel lives in mul_mv_w64.metal
+-                if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
+-                    w64 = true;
+-                }
++                w64 = (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr);
++                smem = w64 ? (256*4) : (256*4 + 128);
              } break;
          case GGML_TYPE_IQ3_S:
              {
@@ -61,8 +55,7 @@ index d06ff89..66b58d2 100644
                  smem = 512*4;
                  // the 64-lane twin of this kernel lives in mul_mv_w64.metal
                  if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
-                     w64 = true;
-                 }
+@@ -2160,8 +2157,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
              } break;
          case GGML_TYPE_IQ2_S:
              {
@@ -79,54 +72,11 @@ index d06ff89..66b58d2 100644
                  smem = 1024*8;
                  // the 64-lane twin of this kernel lives in mul_mv_w64.metal
                  if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
-                     w64 = true;
-                 }
-             } break;
-         case GGML_TYPE_IQ1_S:
-             {
-@@ -2678,29 +2690,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
-             {
-                 nsg = N_SG_Q6_K;
-                 nr0 = N_R0_Q6_K;
-             } break;
-         case GGML_TYPE_IQ2_XXS:
-             {
-                 nsg = N_SG_IQ2_XXS;
-                 nr0 = N_R0_IQ2_XXS;
--                smem = 256*8+128;
-+                smem = 256*8;
-             } break;
-         case GGML_TYPE_IQ2_XS:
-             {
-                 nsg = N_SG_IQ2_XS;
-                 nr0 = N_R0_IQ2_XS;
--                smem = 512*8+128;
-+                smem = 512*8;
-             } break;
-         case GGML_TYPE_IQ3_XXS:
-             {
-                 nsg = N_SG_IQ3_XXS;
-                 nr0 = N_R0_IQ3_XXS;
--                smem = 256*4+128;
-+                smem = 256*4;
-             } break;
-         case GGML_TYPE_IQ3_S:
-             {
-                 nsg = N_SG_IQ3_S;
-                 nr0 = N_R0_IQ3_S;
-                 smem = 512*4;
-             } break;
-         case GGML_TYPE_IQ2_S:
 diff --git a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
-index 49a0dd4..d9268e5 100644
+index c30f99e..69e1700 100644
 --- a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
 +++ b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
-@@ -3041,84 +3041,84 @@ void kernel_mul_mv_iq2_s_f32_w64_impl(
-     const int first_row = (r0 * NSG + sgitg) * nr0;
- 
-     const uint i12 = im%FC_mul_mv_ne12;
-     const uint i13 = im/FC_mul_mv_ne12;
- 
+@@ -3012,8 +3012,8 @@ void kernel_mul_mv_iq2_s_f32_w64_impl(
      const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
      const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
  
@@ -137,16 +87,7 @@ index 49a0dd4..d9268e5 100644
  
      float sumf[nr0]={0.f};
  
-     const int nb32 = nb * (QK_K / 32);
- 
-     // reading the 1024-entry grid straight out of constant memory costs 8 divergent loads per
-     // inner step; staging it once per threadgroup is what iq3_xxs already does
-     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
-     {
-         const int gid = FC_mul_mv_nw*sgitg + tiisg;
-         const int gsz = FC_mul_mv_nw*FC_mul_mv_nsg;
-         for (int i = gid; i < 1024; i += gsz) svalues[i] = iq2s_grid[i];
-         threadgroup_barrier(mem_flags::mem_threadgroup);
+@@ -3030,56 +3030,56 @@ void kernel_mul_mv_iq2_s_f32_w64_impl(
      }
      const threadgroup uint2 * grid = (const threadgroup uint2 *) svalues;
  
@@ -247,17 +188,7 @@ index 49a0dd4..d9268e5 100644
          }
      }
  
-     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
- 
-     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-         float sum_all = simd_sum(sumf[row]);
-         if (tiisg == 0) {
-@@ -3163,78 +3163,84 @@ void kernel_mul_mv_iq3_s_f32_w64_impl(
-     const int first_row = (r0 * NSG + sgitg) * nr0;
- 
-     const uint i12 = im%FC_mul_mv_ne12;
-     const uint i13 = im/FC_mul_mv_ne12;
- 
+@@ -3134,8 +3134,8 @@ void kernel_mul_mv_iq3_s_f32_w64_impl(
      const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
      const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
  
@@ -268,13 +199,7 @@ index 49a0dd4..d9268e5 100644
  
      float sumf[nr0]={0.f};
  
-     const int nb32 = nb * (QK_K / 32);
- 
-     threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
-     {
-         const int gid = FC_mul_mv_nw*sgitg + tiisg;
-         const int gsz = FC_mul_mv_nw*FC_mul_mv_nsg;
-         for (int i = gid; i < 512; i += gsz) svalues[i] = iq3s_grid[i];
+@@ -3149,53 +3149,59 @@ void kernel_mul_mv_iq3_s_f32_w64_impl(
          threadgroup_barrier(mem_flags::mem_threadgroup);
      }
  
@@ -369,17 +294,7 @@ index 49a0dd4..d9268e5 100644
          }
      }
  
-     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
- 
-     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-         float sum_all = simd_sum(sumf[row]);
-         if (tiisg == 0) {
-@@ -3282,75 +3288,76 @@ void kernel_mul_mv_iq2_xs_f32_w64_impl(
-     const uint i13 = im/FC_mul_mv_ne12;
- 
-     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
- 
+@@ -3253,65 +3259,65 @@ void kernel_mul_mv_iq2_xs_f32_w64_impl(
      device const block_iq2_xs * x = (device const block_iq2_xs *) (src0 + offset0);
      device const float        * y = (device const float        *) (src1 + offset1);
  
@@ -454,16 +369,15 @@ index 49a0dd4..d9268e5 100644
 -                }
 -            }
 -            sumf[row] += (hg < 2 ? d1 : d2) * sum;
-+            const uint   q_val = *q2_ptr;
-+            const uint   s7    = q_val >> 9;
-+            const uint   signs = s7 | ((popcount(s7) & 1u) << 7);
++            const uint  q_val = *q2_ptr;
++            const uint  s7    = q_val >> 9;
  
 -            dh += args.nb01/2;
 -            q2 += args.nb01/2;
 -            sc += args.nb01;
 -        }
-+            const uint4  m1    = (uint4(s7)        << uint4(31, 30, 29, 28)) & 0x80000000u;
-+            const uint4  m2    = (uint4(signs >> 4)<< uint4(31, 30, 29, 28)) & 0x80000000u;
++            const uint4 m1    = (uint4(s7) << uint4(31, 30, 29, 28)) & 0x80000000u;
++            const uint4 m2    = uint4(((uint3(s7) << uint3(27, 26, 25)) & 0x80000000u), popcount(s7) << 31);
 +
 +            const uint2  g     = grid[q_val & 511];
 +            const float4 f1    = float4(as_type<uchar4>(g.x));
@@ -482,17 +396,7 @@ index 49a0dd4..d9268e5 100644
      }
  
      device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
- 
-     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-         float sum_all = simd_sum(sumf[row]);
-         if (tiisg == 0) {
-             dst_f32[first_row + row] = sum_all * 0.25f;
-@@ -3397,76 +3404,76 @@ void kernel_mul_mv_iq2_xxs_f32_w64_impl(
-     const uint i13 = im/FC_mul_mv_ne12;
- 
-     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
- 
+@@ -3368,66 +3374,65 @@ void kernel_mul_mv_iq2_xxs_f32_w64_impl(
      device const block_iq2_xxs * x = (device const block_iq2_xxs *) (src0 + offset0);
      device const float         * y = (device const float         *) (src1 + offset1);
  
@@ -569,15 +473,14 @@ index 49a0dd4..d9268e5 100644
 -                }
 -            }
 -            sumf[row] += d * sum;
-+            const uint   grid_idx = *q8_ptr;
-+            const uint   s7       = (aux32 >> sh) & 0x7Fu;
-+            const uint   signs    = s7 | ((popcount(s7) & 1u) << 7);
++            const uint  grid_idx = *q8_ptr;
++            const uint  s7       = (aux32 >> sh) & 0x7Fu;
  
 -            dh += args.nb01/2;
 -            q2 += args.nb01/2;
 -        }
-+            const uint4  m1       = (uint4(s7)        << uint4(31, 30, 29, 28)) & 0x80000000u;
-+            const uint4  m2       = (uint4(signs >> 4)<< uint4(31, 30, 29, 28)) & 0x80000000u;
++            const uint4 m1       = (uint4(s7) << uint4(31, 30, 29, 28)) & 0x80000000u;
++            const uint4 m2       = uint4(((uint3(s7) << uint3(27, 26, 25)) & 0x80000000u), popcount(s7) << 31);
  
 -        y4 += 8 * FC_mul_mv_nw;
 +            const uint2  g        = grid[grid_idx];
@@ -596,17 +499,7 @@ index 49a0dd4..d9268e5 100644
      }
  
      device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
- 
-     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-         float sum_all = simd_sum(sumf[row]);
-         if (tiisg == 0) {
-             dst_f32[first_row + row] = sum_all * 0.25f;
-@@ -3513,88 +3520,75 @@ void kernel_mul_mv_iq3_xxs_f32_w64_impl(
-     const uint i13 = im/FC_mul_mv_ne12;
- 
-     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
- 
+@@ -3484,78 +3489,65 @@ void kernel_mul_mv_iq3_xxs_f32_w64_impl(
      device const block_iq3_xxs * x = (device const block_iq3_xxs *) (src0 + offset0);
      device const float         * y = (device const float         *) (src1 + offset1);
  
@@ -711,8 +604,3 @@ index 49a0dd4..d9268e5 100644
      }
  
      device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
- 
-     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-         float sum_all = simd_sum(sumf[row]);
-         if (tiisg == 0) {
-             dst_f32[first_row + row] = sum_all * 0.5f;
