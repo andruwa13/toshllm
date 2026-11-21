@@ -1,13 +1,8 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index 1f15d6c..6ea92ba 100644
+index ee30236..3aa68f9 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -274,17 +274,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
-     char name[256];
- 
-     const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
- 
-     // only the block types that are not a multiple of four bytes have an aligned variant
+@@ -279,7 +279,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
      const bool align = props->needs_aligned_loads &&
          (tsrc == GGML_TYPE_Q4_0 || tsrc == GGML_TYPE_Q5_0 || tsrc == GGML_TYPE_Q8_0);
  
@@ -20,21 +15,11 @@ index 1f15d6c..6ea92ba 100644
      snprintf(name, 256, "%s", base);
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-     if (!res.pipeline) {
-         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
-     }
- 
-     return res;
 diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
-index bec1d90..6e7d91e 100644
+index bec1d90..1194460 100644
 --- a/ggml/src/ggml-metal/kernels/quantize.metal
 +++ b/ggml/src/ggml-metal/kernels/quantize.metal
-@@ -274,16 +274,157 @@ kernel void kernel_concat(
-         }
- 
-         device T * y = (device T *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
- 
-         *y = *x;
+@@ -279,6 +279,148 @@ kernel void kernel_concat(
      }
  }
  
@@ -109,7 +94,7 @@ index bec1d90..6e7d91e 100644
 +    {
 +        const int c  = tid % CAT_TC;
 +        const int r  = tid / CAT_TC;
-+        const int sc = nthreads/CAT_TC;
++        const int sc = max(1, nthreads/CAT_TC);
 +        const int cg = c0 + c;
 +        if (r < sc && cg < args.ne1) {
 +            for (int t = r; t < CAT_TT; t += sc) {
@@ -134,7 +119,7 @@ index bec1d90..6e7d91e 100644
 +    {
 +        const int t   = tid % CAT_TT;
 +        const int r   = tid / CAT_TT;
-+        const int stw = nthreads/CAT_TT;
++        const int stw = max(1, nthreads/CAT_TT);
 +        const int tg  = t0 + t;
 +        if (r < stw && tg < args.ne0) {
 +            for (int c = r; c < CAT_TC; c += stw) {
@@ -158,8 +143,10 @@ index bec1d90..6e7d91e 100644
 +        ushort3 tpitg[[thread_position_in_threadgroup]],
 +        ushort3   ntg[[threads_per_threadgroup]]) {
 +
++    const int nthreads = ntg.x*ntg.y*ntg.z;
 +    const bool fast = args.dim == 0 && args.ne2 == 1 && args.ne3 == 1 &&
-+                      args.nb0 == 4 && args.nb11 == 4 && args.nb00 == 4;
++                      args.nb0 == 4 && args.nb11 == 4 && args.nb00 == 4 &&
++                      nthreads >= CAT_TC && nthreads >= CAT_TT;
 +
 +    if (!fast) {
 +        kernel_concat_f32_scalar(args, src0, src1, dst, tgpig, tpitg, ntg);
@@ -168,7 +155,6 @@ index bec1d90..6e7d91e 100644
 +
 +    const int groups = ntg.y > 1 ? (args.ne1 + ntg.y - 1)/ntg.y
 +                                 : args.ne1*max(1, args.nc0);
-+    const int nthreads = ntg.x*ntg.y*ntg.z;
 +    const int tid = tpitg.x + ntg.x*(tpitg.y + ntg.y*tpitg.z);
 +
 +    threadgroup float tile[CAT_TC*(CAT_TT + 1)];
@@ -182,21 +168,11 @@ index bec1d90..6e7d91e 100644
  typedef decltype(kernel_concat<float>) kernel_concat_t;
  
  template [[host_name("kernel_concat_f32")]]  kernel kernel_concat_t kernel_concat<float>;
- template [[host_name("kernel_concat_f16")]]  kernel kernel_concat_t kernel_concat<half>;
- #if defined(GGML_METAL_HAS_BF16)
- template [[host_name("kernel_concat_bf16")]] kernel kernel_concat_t kernel_concat<bfloat>;
- #endif
- template [[host_name("kernel_concat_i8")]]   kernel kernel_concat_t kernel_concat<char>;
 diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
-index 0001daa..9a3d79b 100644
+index 0001daa..d59d27a 100644
 --- a/ggml/src/ggml-metal/kernels/ssm.metal
 +++ b/ggml/src/ggml-metal/kernels/ssm.metal
-@@ -236,59 +236,125 @@ kernel void kernel_ssm_conv_f32_f32_batched(
-     float sumf = 0.0f;
-     FOR_UNROLL (int64_t i0 = 0; i0 < nc; ++i0) {
-         sumf += s[i0] * c[i0];
-     }
- 
+@@ -241,6 +241,10 @@ kernel void kernel_ssm_conv_f32_f32_batched(
      x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
  }
  
@@ -207,8 +183,7 @@ index 0001daa..9a3d79b 100644
  kernel void kernel_ssm_conv_f32_f32_batched_4(
          constant ggml_metal_kargs_ssm_conv & args,
          device const  void * src0,
-         device const  void * src1,
-         device       float * dst,
+@@ -249,41 +253,103 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
          uint3 tgpig[[threadgroup_position_in_grid]],
          uint3 tpitg[[thread_position_in_threadgroup]],
          uint3   ntg[[threads_per_threadgroup]]) {
@@ -250,12 +225,12 @@ index 0001daa..9a3d79b 100644
 +        if (i2 >= n_t) {
 +            return;
 +        }
-+        device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
-+        device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
-+        device       float  * x = (device       float  *) ((device       char *) dst  + ir*args.nb0  + i2*args.nb1  + i3*args.nb2);
++        device const float * c = (device const float *) ((device const char *) src1 + ir*args.nb11);
++        device const float * s = (device const float *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
++        device       float * x = (device       float *) ((device       char *) dst  + ir*args.nb0  + i2*args.nb1  + i3*args.nb2);
 +        float sumf = 0.0f;
-+        for (int64_t i0 = 0; i0 < nc/4; ++i0) {
-+            sumf += dot(s[i0], c[i0]);
++        for (int64_t i0 = 0; i0 < nc; ++i0) {
++            sumf += s[i0] * c[i0];
 +        }
 +        x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
          return;
@@ -340,8 +315,3 @@ index 0001daa..9a3d79b 100644
  }
  
  // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
- // Optimized version: reduces redundant memory loads by having one thread load shared values
- // TAIL == false is the whole-sequence / decode path: token_offset folds away at compile time.
- template<bool TAIL>
- kernel void kernel_ssm_scan_impl(
-         constant ggml_metal_kargs_ssm_scan & args,
