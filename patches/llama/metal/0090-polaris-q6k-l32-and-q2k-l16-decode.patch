@@ -1,13 +1,8 @@
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index 6ea92ba..d06ff89 100644
+index 3aa68f9..c7e3d52 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -1955,16 +1955,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
-                 if ((simd_width == 64 || TOSH_ENV("TOSH_MV_R8") != nullptr) && TOSH_ENV("TOSH_MV_R8_DISABLE") == nullptr) {
-                     nsg = 1;
-                     nr0 = 8;
-                     suffix = "_r8";
-                 } else {
+@@ -1974,6 +1974,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                      nsg = N_SG_Q2_K;
                      nr0 = N_R0_Q2_K;
                  }
@@ -23,17 +18,7 @@ index 6ea92ba..d06ff89 100644
                  // the 64-lane twin of this kernel lives in mul_mv_w64.metal
                  if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                      w64 = true;
-                 }
-             } break;
-         case GGML_TYPE_Q3_K:
-             {
-                 // A 64-lane variant with thirty-two lanes per block and the mask tables derived
-@@ -2068,16 +2077,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
-                     } else {
-                         nr0 = 4;
-                         suffix = "_r4";
-                     }
-                 } else {
+@@ -2087,6 +2096,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                      nsg = N_SG_Q6_K;
                      nr0 = N_R0_Q6_K;
                  }
@@ -51,21 +36,82 @@ index 6ea92ba..d06ff89 100644
                  // the 64-lane twin of this kernel lives in mul_mv_w64.metal
                  if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                      w64 = true;
-                 }
-             } break;
-         case GGML_TYPE_IQ2_XXS:
-             {
-                 nsg = N_SG_IQ2_XXS;
 diff --git a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
-index f4eca9e..49a0dd4 100644
+index be9a832..c30f99e 100644
 --- a/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
 +++ b/ggml/src/ggml-metal/kernels/mul_mv_w64.metal
-@@ -2508,18 +2508,17 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
-     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+@@ -467,21 +467,14 @@ void kernel_mul_mv_q6_K_f32_w64_wide_impl(
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
  
-     device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
-     device const float     * yy = (device const float      *) (src1 + offset1);
+-            // eight bytes land aligned whenever the row stride is a multiple of eight; the
+-            // two-word fallback keeps the odd strides correct
+-            uint2 w1, w2, wh;
+-            if (FC_mul_mv_row8) {
+-                w1 = mv_ld_u32x2(q1);
+-                w2 = mv_ld_u32x2(q2);
+-                wh = mv_ld_u32x2(qh);
+-            } else {
+-                device const ushort * s1 = (device const ushort *) q1;
+-                device const ushort * s2 = (device const ushort *) q2;
+-                device const ushort * sh = (device const ushort *) qh;
+-                w1 = uint2((uint) s1[0] | ((uint) s1[1] << 16), (uint) s1[2] | ((uint) s1[3] << 16));
+-                w2 = uint2((uint) s2[0] | ((uint) s2[1] << 16), (uint) s2[2] | ((uint) s2[3] << 16));
+-                wh = uint2((uint) sh[0] | ((uint) sh[1] << 16), (uint) sh[2] | ((uint) sh[3] << 16));
+-            }
++            // the block is 210 bytes, so odd blocks sit two bytes off a word boundary;
++            // reading pairs of shorts is naturally aligned across all blocks
++            device const ushort * s1 = (device const ushort *) q1;
++            device const ushort * s2 = (device const ushort *) q2;
++            device const ushort * sh = (device const ushort *) qh;
++            const uint2 w1 = uint2((uint) s1[0] | ((uint) s1[1] << 16), (uint) s1[2] | ((uint) s1[3] << 16));
++            const uint2 w2 = uint2((uint) s2[0] | ((uint) s2[1] << 16), (uint) s2[2] | ((uint) s2[3] << 16));
++            const uint2 wh = uint2((uint) sh[0] | ((uint) sh[1] << 16), (uint) sh[2] | ((uint) sh[3] << 16));
+ 
+             FOR_UNROLL (short l = 0; l < 8; ++l) {
+                 const uint w = l < 4 ? 0 : 1;
+@@ -2427,28 +2420,20 @@ void kernel_mul_mv_q6_K_f32_w64_impl(
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
+ 
+-            // the block is 210 bytes, so every other one sits two bytes off a word and a
+-            // card that requires natural alignment reads the wrong bytes; two shorts land
+-            // right on every block, and one word is fine where the row stride allows it
+-            uint w1 = 0, w2 = 0, wh = 0;
+-            if (FC_mul_mv_row8) {
+-                w1 = mv_ld_u32(q1);
+-                w2 = mv_ld_u32(q2);
+-                wh = mv_ld_u32(qh);
+-            } else if (FC_mul_mv_row4) {
+-                device const ushort * s1 = (device const ushort *) q1;
+-                device const ushort * s2 = (device const ushort *) q2;
+-                device const ushort * sh = (device const ushort *) qh;
+-
+-                w1 = (uint) s1[0] | ((uint) s1[1] << 16);
+-                w2 = (uint) s2[0] | ((uint) s2[1] << 16);
+-                wh = (uint) sh[0] | ((uint) sh[1] << 16);
+-            }
++            // the block is 210 bytes, so odd blocks sit two bytes off a word boundary;
++            // reading pairs of shorts is naturally aligned across all blocks
++            device const ushort * s1 = (device const ushort *) q1;
++            device const ushort * s2 = (device const ushort *) q2;
++            device const ushort * sh = (device const ushort *) qh;
++
++            const uint w1 = (uint) s1[0] | ((uint) s1[1] << 16);
++            const uint w2 = (uint) s2[0] | ((uint) s2[1] << 16);
++            const uint wh = (uint) sh[0] | ((uint) sh[1] << 16);
+ 
+             FOR_UNROLL (short l = 0; l < 4; ++l) {
+-                const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w1 >> (8*l)) : q1[l];
+-                const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w2 >> (8*l)) : q2[l];
+-                const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(wh >> (8*l)) : qh[l];
++                const uint8_t b1 = (uint8_t)(w1 >> (8*l));
++                const uint8_t b2 = (uint8_t)(w2 >> (8*l));
++                const uint8_t bh = (uint8_t)(wh >> (8*l));
+ 
+                 sums[0] += yl[4*l + 0] * ((int8_t)((b1 & 0xF) | ((bh & kmask1) << 4)) - 32);
+                 sums[1] += yl[4*l + 1] * ((int8_t)((b2 & 0xF) | ((bh & kmask2) << 2)) - 32);
+@@ -2514,8 +2499,7 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
  
      float sumf[nr0] = { 0.f };
  
@@ -75,41 +121,56 @@ index f4eca9e..49a0dd4 100644
      float yl[32];
  
      // 16 threads per block-group; scale the group count with the SIMD width so ip stays
-     // in {0,1} on wave64 (NG = 2 on wave32, 4 on wave64).
-     const short NG  = FC_mul_mv_nw/8;
-     const short tid = tiisg%8;
-     const short ix  = tiisg/8;
-     const short ip  = tid/4;         // 0 or 1
-@@ -2576,19 +2575,22 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
-             } else if (FC_mul_mv_row4) {
-                 device const ushort * s1 = (device const ushort *) q1;
-                 device const ushort * s2 = (device const ushort *) q2;
-                 device const ushort * sh = (device const ushort *) qh;
+@@ -2562,32 +2546,23 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
  
-                 w1 = (uint) s1[0] | ((uint) s1[1] << 16);
-                 w2 = (uint) s2[0] | ((uint) s2[1] << 16);
-                 wh = (uint) sh[0] | ((uint) sh[1] << 16);
-+                v1 = (uint) s1[2] | ((uint) s1[3] << 16);
-+                v2 = (uint) s2[2] | ((uint) s2[3] << 16);
-+                vh = (uint) sh[2] | ((uint) sh[3] << 16);
-             }
+-            // the block is 210 bytes, so every other one sits two bytes off a word and a
+-            // card that requires natural alignment reads the wrong bytes; two shorts land
+-            // right on every block, and one word is fine where the row stride allows it
+-            uint w1 = 0, w2 = 0, wh = 0;
+-            uint v1 = 0, v2 = 0, vh = 0;
+-            if (FC_mul_mv_row8) {
+-                w1 = mv_ld_u32(q1);
+-                w2 = mv_ld_u32(q2);
+-                wh = mv_ld_u32(qh);
+-                v1 = mv_ld_u32(q1 + 4);
+-                v2 = mv_ld_u32(q2 + 4);
+-                vh = mv_ld_u32(qh + 4);
+-            } else if (FC_mul_mv_row4) {
+-                device const ushort * s1 = (device const ushort *) q1;
+-                device const ushort * s2 = (device const ushort *) q2;
+-                device const ushort * sh = (device const ushort *) qh;
+-
+-                w1 = (uint) s1[0] | ((uint) s1[1] << 16);
+-                w2 = (uint) s2[0] | ((uint) s2[1] << 16);
+-                wh = (uint) sh[0] | ((uint) sh[1] << 16);
+-            }
++            // the block is 210 bytes, so odd blocks sit two bytes off a word boundary;
++            // reading pairs of shorts is naturally aligned across all blocks
++            device const ushort * s1 = (device const ushort *) q1;
++            device const ushort * s2 = (device const ushort *) q2;
++            device const ushort * sh = (device const ushort *) qh;
  
 -            FOR_UNROLL (short l = 0; l < 4; ++l) {
+-                const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? w1 : v1) >> (8*(l&3))) : q1[l];
+-                const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? w2 : v2) >> (8*(l&3))) : q2[l];
+-                const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? wh : vh) >> (8*(l&3))) : qh[l];
++            const uint w1 = (uint) s1[0] | ((uint) s1[1] << 16);
++            const uint w2 = (uint) s2[0] | ((uint) s2[1] << 16);
++            const uint wh = (uint) sh[0] | ((uint) sh[1] << 16);
++            const uint v1 = (uint) s1[2] | ((uint) s1[3] << 16);
++            const uint v2 = (uint) s2[2] | ((uint) s2[3] << 16);
++            const uint vh = (uint) sh[2] | ((uint) sh[3] << 16);
++
 +            FOR_UNROLL (short l = 0; l < 8; ++l) {
-                 const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? w1 : v1) >> (8*(l&3))) : q1[l];
-                 const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? w2 : v2) >> (8*(l&3))) : q2[l];
-                 const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)((l < 4 ? wh : vh) >> (8*(l&3))) : qh[l];
++                const uint8_t b1 = (uint8_t)((l < 4 ? w1 : v1) >> (8*(l&3)));
++                const uint8_t b2 = (uint8_t)((l < 4 ? w2 : v2) >> (8*(l&3)));
++                const uint8_t bh = (uint8_t)((l < 4 ? wh : vh) >> (8*(l&3)));
  
                  sums[0] += yl[4*l + 0] * ((int8_t)((b1 & 0xF) | ((bh & kmask1) << 4)) - 32);
                  sums[1] += yl[4*l + 1] * ((int8_t)((b2 & 0xF) | ((bh & kmask2) << 2)) - 32);
-                 sums[2] += yl[4*l + 2] * ((int8_t)((b1  >> 4) | ((bh & kmask3) << 0)) - 32);
-                 sums[3] += yl[4*l + 3] * ((int8_t)((b2  >> 4) | ((bh & kmask4) >> 2)) - 32);
-@@ -2647,18 +2649,17 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
-     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
- 
-     device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
-     device const float     * yy = (device const float      *) (src1 + offset1);
+@@ -2653,8 +2628,7 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
  
      float sumf[nr0] = { 0.f };
  
@@ -119,27 +180,37 @@ index f4eca9e..49a0dd4 100644
      float yl[8];
  
      // 16 threads per block-group; scale the group count with the SIMD width so ip stays
-     // in {0,1} on wave64 (NG = 2 on wave32, 4 on wave64).
-     const short NG  = FC_mul_mv_nw/32;
-     const short tid = tiisg%32;
-     const short ix  = tiisg/32;
-     const short ip  = tid/16;         // 0 or 1
-@@ -2699,17 +2700,17 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
-                 device const ushort * s2 = (device const ushort *) q2;
-                 device const ushort * sh = (device const ushort *) qh;
+@@ -2691,24 +2665,16 @@ void kernel_mul_mv_q6_K_f32_L32_w64_impl(
+         for (short row = 0; row < nr0; ++row) {
+             float4 sums = {0.f, 0.f, 0.f, 0.f};
  
-                 w1 = (uint) s1[0];
-                 w2 = (uint) s2[0];
-                 wh = (uint) sh[0];
-             }
+-            // the block is 210 bytes, so every other one sits two bytes off a word and a
+-            // card that requires natural alignment reads the wrong bytes; two shorts land
+-            // right on every block, and one word is fine where the row stride allows it
+-            uint w1 = 0, w2 = 0, wh = 0;
+-            if (FC_mul_mv_row4) {
+-                device const ushort * s1 = (device const ushort *) q1;
+-                device const ushort * s2 = (device const ushort *) q2;
+-                device const ushort * sh = (device const ushort *) qh;
+-
+-                w1 = (uint) s1[0];
+-                w2 = (uint) s2[0];
+-                wh = (uint) sh[0];
+-            }
++            // the block is 210 bytes, so odd blocks sit two bytes off a word boundary;
++            // reading one short is naturally aligned across all blocks
++            const ushort w1 = *(device const ushort *) q1;
++            const ushort w2 = *(device const ushort *) q2;
++            const ushort wh = *(device const ushort *) qh;
  
 -            FOR_UNROLL (short l = 0; l < 4; ++l) {
+-                const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w1 >> (8*l)) : q1[l];
+-                const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w2 >> (8*l)) : q2[l];
+-                const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(wh >> (8*l)) : qh[l];
 +            FOR_UNROLL (short l = 0; l < 2; ++l) {
-                 const uint8_t b1 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w1 >> (8*l)) : q1[l];
-                 const uint8_t b2 = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(w2 >> (8*l)) : q2[l];
-                 const uint8_t bh = (FC_mul_mv_row4 || FC_mul_mv_row8) ? (uint8_t)(wh >> (8*l)) : qh[l];
++                const uint8_t b1 = (uint8_t)(w1 >> (8*l));
++                const uint8_t b2 = (uint8_t)(w2 >> (8*l));
++                const uint8_t bh = (uint8_t)(wh >> (8*l));
  
                  sums[0] += yl[4*l + 0] * ((int8_t)((b1 & 0xF) | ((bh & kmask1) << 4)) - 32);
                  sums[1] += yl[4*l + 1] * ((int8_t)((b2 & 0xF) | ((bh & kmask2) << 2)) - 32);
-                 sums[2] += yl[4*l + 2] * ((int8_t)((b1  >> 4) | ((bh & kmask3) << 0)) - 32);
-                 sums[3] += yl[4*l + 3] * ((int8_t)((b2  >> 4) | ((bh & kmask4) >> 2)) - 32);
