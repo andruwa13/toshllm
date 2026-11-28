@@ -440,6 +440,47 @@ private struct AgentRunContext {
     var mathRequired = false
 }
 
+/// Synchronizes `URLSession` task creation for a streaming chat request with `ChatStore.stop()`
+/// so cancellation just before `bytes(for:delegate:)` aborts task launch before any POST leaves the client
+/// and avoids firing an out-of-order `DELETE` ahead of the request.
+private final class StreamLaunchGate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    let port: Int
+    let identity: String
+    private var stopped = false
+    private var launched = false
+    private weak var networkTask: URLSessionTask?
+
+    init(port: Int, identity: String) {
+        self.port = port
+        self.identity = identity
+    }
+
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+        let shouldCancel = lock.withLock { () -> Bool in
+            if stopped { return true }
+            launched = true
+            networkTask = task
+            return false
+        }
+        if shouldCancel { task.cancel() }
+    }
+
+    /// Marks the stream stopped and returns its server identity only if a network task was launched.
+    func cancel() -> (port: Int, identity: String)? {
+        let (activeTask, wasLaunched) = lock.withLock { () -> (URLSessionTask?, Bool) in
+            stopped = true
+            let task = networkTask
+            networkTask = nil
+            let result = launched
+            launched = false
+            return (task, result)
+        }
+        activeTask?.cancel()
+        return wasLaunched ? (port, identity) : nil
+    }
+}
+
 @MainActor
 final class ChatStore: ObservableObject {
     /// Room for the medium reasoning budget and an answer after it.
@@ -475,6 +516,15 @@ final class ChatStore: ObservableObject {
     @Published var generatingConvID: UUID?
     @Published var compacting = false
     @Published var lastError: String?
+    private var streamSequence: UInt64 = 0
+    private var callbackSequence: UInt64 = 0
+    nonisolated(unsafe) private var pumpTask: Task<Void, Never>?
+    nonisolated(unsafe) private var slotSaveTask: Task<Void, Never>?
+    private var slotSaveStreamID: UInt64 = 0
+    nonisolated(unsafe) private var slotRestoreTask: Task<Bool, Never>?
+    private var slotRestoreSequence: UInt64 = 0
+    private(set) var awaitingSlotPreparation = false
+    private(set) var finishedStreamTaskCount = 0
     @Published var pendingToolPermission: PendingToolPermission?
     @Published var pendingAgentContinuation: PendingAgentContinuation?
     /// How the last user message was read.
@@ -603,10 +653,10 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    private var task: Task<Void, Never>?
-    private var watchdog: Task<Void, Never>?
-    /// Where the running reply is streamed from, so Stop can cancel it on the engine too.
-    private var activeStream: (port: Int, identity: String)?
+    nonisolated(unsafe) private var task: Task<Void, Never>?
+    nonisolated(unsafe) private var watchdog: Task<Void, Never>?
+    /// Synchronizes network stream launch with `stop()` and tracks active engine cancellation.
+    nonisolated(unsafe) private var activeStreamGate: StreamLaunchGate?
     /// Estimated tokens of the tool definitions the last request sent, which the context holds before any reply.
     @Published private(set) var toolTokens = 0
     private var slotConvID: UUID?
@@ -619,7 +669,12 @@ final class ChatStore: ObservableObject {
     /// Set for a store without a window, such as a test's, so it never reads or rewrites the
     /// user's conversations, nor their saved KV.
     private let storageDirectory: URL?
+    private let slotCacheDirectory: URL?
+    private let stopStalledEngine: @MainActor (String) -> Void
+    private let onBeforeStreamRequest: (@Sendable () async -> Void)?
+    nonisolated(unsafe) private var engineStartObserver: NSObjectProtocol?
     nonisolated let headless: Bool
+    nonisolated private var activeSlotCacheDir: URL { slotCacheDirectory ?? ServerSettings.primarySlotCacheDir }
 
     private var fileURL: URL {
         let dir = storageDirectory ?? AppSupport.directory
@@ -633,8 +688,17 @@ final class ChatStore: ObservableObject {
         fileURL.deletingLastPathComponent().appendingPathComponent("projects.json")
     }
 
-    init(storageDirectory: URL? = nil) {
+    init(storageDirectory: URL? = nil,
+         slotCacheDirectory: URL? = nil,
+         stopStalledEngine: @escaping @MainActor (String) -> Void = { reason in
+             ServerManager.shared.active.note("the chat stopped the engine: \(reason)")
+             ServerManager.shared.active.stop()
+         },
+         onBeforeStreamRequest: (@Sendable () async -> Void)? = nil) {
         self.storageDirectory = storageDirectory
+        self.slotCacheDirectory = slotCacheDirectory
+        self.stopStalledEngine = stopStalledEngine
+        self.onBeforeStreamRequest = onBeforeStreamRequest
         headless = storageDirectory != nil
         load()
         if !headless { Self.live = self }
@@ -648,8 +712,22 @@ final class ChatStore: ObservableObject {
         if storageDirectory == nil { pruneOrphanSlots() }
         // A fresh engine has empty KV slots: forget which conversation slot 0
         // held, so the next turn restores the active one's persisted cache.
-        NotificationCenter.default.addObserver(forName: .engineDidStart, object: nil, queue: .main) { [weak self] _ in
+        engineStartObserver = NotificationCenter.default.addObserver(forName: .engineDidStart, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.slotConvID = nil }
+        }
+    }
+
+    deinit {
+        if let engineStartObserver {
+            NotificationCenter.default.removeObserver(engineStartObserver)
+        }
+        task?.cancel()
+        pumpTask?.cancel()
+        watchdog?.cancel()
+        slotSaveTask?.cancel()
+        slotRestoreTask?.cancel()
+        if let gate = activeStreamGate {
+            Self.dispatchEngineStop(for: gate)
         }
     }
 
@@ -678,7 +756,7 @@ final class ChatStore: ObservableObject {
     }
 
     func delete(_ c: Conversation) {
-        if generating && c.id == currentID { stop() }
+        if generating && (c.id == generatingConvID || (generatingConvID == nil && c.id == currentID)) { stop() }
         if pendingToolPermission?.conversationID == c.id {
             pendingToolPermission = nil
             agentContext = nil
@@ -693,8 +771,10 @@ final class ChatStore: ObservableObject {
         if currentID == c.id { currentID = conversations.first?.id }
         if conversations.isEmpty { newConversation() }
         // Drop its persisted KV slot file too, and forget it if it was loaded.
-        try? FileManager.default.removeItem(
-            at: ServerSettings.primarySlotCacheDir.appendingPathComponent(Self.slotFile(c.id)))
+        if !headless || slotCacheDirectory != nil {
+            try? FileManager.default.removeItem(
+                at: activeSlotCacheDir.appendingPathComponent(Self.slotFile(c.id)))
+        }
         if slotConvID == c.id { slotConvID = nil }
         save()
     }
@@ -726,9 +806,11 @@ final class ChatStore: ObservableObject {
         agentContext = nil
         queuedMessage = nil
         task?.cancel()
-        for c in conversations {
-            try? FileManager.default.removeItem(
-                at: ServerSettings.primarySlotCacheDir.appendingPathComponent(Self.slotFile(c.id)))
+        if !headless || slotCacheDirectory != nil {
+            for c in conversations {
+                try? FileManager.default.removeItem(
+                    at: activeSlotCacheDir.appendingPathComponent(Self.slotFile(c.id)))
+            }
         }
         conversations.removeAll()
         slotConvID = nil
@@ -892,7 +974,6 @@ final class ChatStore: ObservableObject {
               sampling: ChatSamplingSettings = ChatSamplingSettings(),
               modalities: ModelModalities? = nil) {
         guard !generating, let i = currentIndex else { return }
-        lastError = nil
         pendingAgentContinuation = nil
         queuedMessage = nil
         agentContext = nil
@@ -939,14 +1020,23 @@ final class ChatStore: ObservableObject {
                         agentDeclined: Bool = false) {
         generating = true
         generatingConvID = conversations[i].id
+        streamSequence &+= 1
+        callbackSequence &+= 1
+        let streamID = streamSequence
+        let cbID = callbackSequence
+        pumpTask?.cancel()
+        pumpTask = nil
+        lastError = nil
         live.reset()
         // The user can switch or delete conversations mid-stream; the result
         // must land in the one this request started from, found by id.
         let convID = conversations[i].id
         agentPassMessage[convID] = nil
         let toolCwd = effectiveWorkingDirectory(for: convID)
-        activeStream = (port, ChatStreamIdentity.value(conversationID: convID,
-                                                       model: ServerSettings.activeRouterModel()))
+        let activeModel = ServerSettings.activeRouterModel()
+        let streamIdentity = ChatStreamIdentity.value(conversationID: convID, model: activeModel)
+        let launchGate = StreamLaunchGate(port: port, identity: streamIdentity)
+        activeStreamGate = launchGate
         let systemWithCwd = ScientificToolsService.system(toolCwd.map {
             (system.isEmpty ? "" : system + "\n\n")
             + "File tools work inside \($0). Use paths relative to it, and never call them for text that only exists in this conversation."
@@ -995,7 +1085,7 @@ final class ChatStore: ObservableObject {
         conversations[i].messages.append(ChatMessage(role: "assistant", content: ""))
 
         let buffer = StreamBuffer()
-        startWatchdog(buffer)
+        startWatchdog(buffer, streamID: streamID)
         let pump = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let snap = buffer.take() else {
@@ -1003,16 +1093,19 @@ final class ChatStore: ObservableObject {
                     continue
                 }
                 if snap.done { break }   // finish() publishes the final transcript
-                self?.live.update(reasoning: snap.reasoning, visible: snap.visible, speed: snap.speed)
+                guard let self, self.streamSequence == streamID else { break }
+                self.live.update(reasoning: snap.reasoning, visible: snap.visible, speed: snap.speed)
                 let prefilling = snap.reasoning.isEmpty && snap.visible.isEmpty
-                self?.live.setPrefillProgress(prefilling ? snap.progress : nil)
+                self.live.setPrefillProgress(prefilling ? snap.progress : nil)
                 let n = snap.visible.count
                 let ms = n > 12000 ? 600 : n > 6000 ? 350 : n > 2500 ? 180 : 80
                 try? await Task.sleep(for: .milliseconds(ms))
             }
         }
+        pumpTask = pump
 
-        task = Task.detached(priority: .userInitiated) { [weak self, buffer, pump] in
+        let beforeStreamRequest = onBeforeStreamRequest
+        task = Task.detached(priority: .userInitiated) { [weak self, buffer, pump, launchGate, beforeStreamRequest] in
             var nTokens = 0
             let tSent = Date()
             var tFirst: Date?
@@ -1108,7 +1201,10 @@ final class ChatStore: ObservableObject {
                         }
                         buffer.note()
                         let owner = self
-                        await MainActor.run { owner?.agentEvent(event, conversation: convID) }
+                        await MainActor.run {
+                            guard owner?.streamSequence == streamID, owner?.callbackSequence == cbID else { return }
+                            owner?.agentEvent(event, conversation: convID)
+                        }
                         continue
                     }
                     if drafted, line.hasPrefix("data: "), line.contains("\"content\":\""), !line.contains("\"content\":\"\"") {
@@ -1140,6 +1236,7 @@ final class ChatStore: ObservableObject {
                 // Restore this conversation's persisted KV (if any) so the slot
                 // holds the unchanged history and only the new turn is prefilled.
                 await self?.prepareSlot(convID: convID, port: port)
+                try Task.checkCancellation()
 
                 if availableTools.isEmpty {
                     if toolsEnabled {
@@ -1154,6 +1251,7 @@ final class ChatStore: ObservableObject {
                     if memoryToolsEnabled { availableTools.append(contentsOf: ChatMemoryService.tools) }
                     if ChatMapTool.isEnabled { availableTools.append(ChatMapTool.tool) }
                     if ChatMapTool.isEnabled && ChatRoadRoute.isEnabled { availableTools.append(ChatRoadRoute.tool) }
+                    try Task.checkCancellation()
                     availableTools += await ToshMCPService.shared.discoverTools()
                     if ToolSupport.isBlocked(ToolSupport.currentModelIdentity) { availableTools = [] }
                     if let enabledToolNames {
@@ -1161,6 +1259,7 @@ final class ChatStore: ObservableObject {
                         availableTools.removeAll { !selected.contains($0.name) }
                     }
                 }
+                try Task.checkCancellation()
                 // only math tools: the server agent runs the turn. A math tool the user still approves call by
                 // call keeps it in this loop, since the server cannot ask. MCP servers shared with the engine
                 // are only reached through that agent, like the servers a build bundles with its own agent.
@@ -1182,8 +1281,6 @@ final class ChatStore: ObservableObject {
                 if let key = ServerSettings.activeAPIKey() {
                     req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
                 }
-                let activeModel = ServerSettings.activeRouterModel()
-                let streamIdentity = ChatStreamIdentity.value(conversationID: convID, model: activeModel)
                 req.setValue(streamIdentity, forHTTPHeaderField: "X-Conversation-Id")
                 var body: [String: Any] = [
                     "messages": history,
@@ -1239,12 +1336,18 @@ final class ChatStore: ObservableObject {
                     let (intent, asked) = await MathIntent.decide(request, context: Array(userTexts.dropLast()), port: port)
                     AppLog.chat.notice("math intent \(intent.rawValue, privacy: .public)\(asked ? " (model)" : "", privacy: .public)")
                     let owner = self
-                    await MainActor.run { owner?.lastMathIntent = intent }
+                    await MainActor.run {
+                        guard owner?.streamSequence == streamID, owner?.callbackSequence == cbID else { return }
+                        owner?.lastMathIntent = intent
+                    }
                     gate = intent.requiresTools
                     hold = hold || gate
                 } else if request != nil {
                     let owner = self
-                    await MainActor.run { owner?.lastMathIntent = nil }
+                    await MainActor.run {
+                        guard owner?.streamSequence == streamID, owner?.callbackSequence == cbID else { return }
+                        owner?.lastMathIntent = nil
+                    }
                 }
                 if agentTurn && clientToolsAgent {
                     let definitions = clientTools.compactMap(\.openAIDefinition)
@@ -1267,7 +1370,10 @@ final class ChatStore: ObservableObject {
                     .flatMap { try? JSONSerialization.data(withJSONObject: $0) }?.count ?? 0
                 // about four characters per token in a JSON schema
                 let toolOwner = self
-                await MainActor.run { toolOwner?.toolTokens = schemas / 4 }
+                await MainActor.run {
+                    guard toolOwner?.streamSequence == streamID, toolOwner?.callbackSequence == cbID else { return }
+                    toolOwner?.toolTokens = schemas / 4
+                }
                 if reasoningOff {
                     body["chat_template_kwargs"] = ["enable_thinking": false]
                     // For templates that ignore enable_thinking (Qwen3.6 still
@@ -1292,8 +1398,10 @@ final class ChatStore: ObservableObject {
                     body.merge(custom) { _, customValue in customValue }
                 }
                 req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                try Task.checkCancellation()
+                if let beforeStreamRequest { await beforeStreamRequest() }
 
-                let (bytes, response) = try await ChatStore.streamingSession.bytes(for: req)
+                let (bytes, response) = try await ChatStore.streamingSession.bytes(for: req, delegate: launchGate)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 guard status == 200 else {
                     // The error body explains the cause (e.g. context overflow);
@@ -1333,7 +1441,7 @@ final class ChatStore: ObservableObject {
                             resumeRequest.setValue("Bearer " + key,
                                                    forHTTPHeaderField: "Authorization")
                         }
-                        let (resumeBytes, resumeResponse) = try await ChatStore.streamingSession.bytes(for: resumeRequest)
+                        let (resumeBytes, resumeResponse) = try await ChatStore.streamingSession.bytes(for: resumeRequest, delegate: launchGate)
                         let resumeStatus = (resumeResponse as? HTTPURLResponse)?.statusCode ?? 0
                         guard resumeStatus == 200 else {
                             throw StreamError(message: "Stream resume failed (HTTP \(resumeStatus))")
@@ -1381,7 +1489,10 @@ final class ChatStore: ObservableObject {
                                                        outlook: stream?.gpu == true ? GPURecovery.shared.outlook(port: port) : .restarting)
                         : stream?.cut == true ? Self.cutConnectionMessage()
                         : raw
-                    await MainActor.run { store?.lastError = message }
+                    await MainActor.run {
+                        guard store?.streamSequence == streamID, store?.callbackSequence == cbID else { return }
+                        store?.lastError = message
+                    }
                 }
             }
 
@@ -1441,20 +1552,23 @@ final class ChatStore: ObservableObject {
             let needed = contextNeeded
             let declined = wasAgentTurn && !wasCancelled && !didReportError && !hasVisibleAnswer
                 && finalToolCalls.isEmpty && Self.agentDeclined(finalMeta)
-            let (shouldDeliverQueued, followed): (Bool, Bool) = await MainActor.run {
-                if retry || declined, let index = store?.conversations.firstIndex(where: { $0.id == convID }) {
+            let (saveTask, shouldDeliverQueued): (Task<Void, Never>?, Bool) = await MainActor.run {
+                guard store?.streamSequence == streamID else { return (nil, false) }
+                let stopped = store?.callbackSequence != cbID
+                let effectiveCancelled = wasCancelled || stopped
+                if !stopped, retry || declined, let index = store?.conversations.firstIndex(where: { $0.id == convID }) {
                     if retry { Self.serverAgentMissing = true }
                     else { AppLog.chat.notice("the agent left this turn to the chat's own tools") }
                     store?.finish(conversation: convID, text: "", speed: nil)
                     store?.stream(into: index, port: port, temperature: temperature, maxTokens: maxTokens,
                                   system: system, thinking: thinking, sampling: sampling, modalities: modalities,
                                   agentDeclined: declined)
-                    return (false, true)
+                    return (nil, false)
                 }
-                if !wasCancelled && !didReportError && hadReasoning && !hasVisibleAnswer
+                if !effectiveCancelled && !didReportError && hadReasoning && !hasVisibleAnswer
                     && finalToolCalls.isEmpty && closing == nil {
                     store?.lastError = Self.emptyResponseMessage(finishReason: finalFinishReason)
-                } else if !wasCancelled && !didReportError && hasVisibleAnswer && finalToolCalls.isEmpty
+                } else if !effectiveCancelled && !didReportError && hasVisibleAnswer && finalToolCalls.isEmpty
                             && finalFinishReason == "length" && !answer.hasSuffix("incomplete._")
                             && !answer.hasSuffix("incompleta._") {
                     // an answer cut at its token limit must not read as a finished one, nor one the context cut
@@ -1462,7 +1576,7 @@ final class ChatStore: ObservableObject {
                     store?.lastError = Self.cutByContext(usage: finalUsage, maxTokens: maxTokens,
                                                          context: Self.contextLimitSetting())
                         ? Self.contextCutMessage() : Self.cutAnswerMessage()
-                } else if !wasCancelled && !didReportError && !hasVisibleAnswer && !hadReasoning
+                } else if !effectiveCancelled && !didReportError && !hasVisibleAnswer && !hadReasoning
                             && finalToolCalls.isEmpty && closing == nil {
                     store?.lastError = Self.noAnswerMessage()
                 }
@@ -1474,10 +1588,10 @@ final class ChatStore: ObservableObject {
                 } else if !wasAgentTurn, let finalUsage {
                     store?.setContextUsed(finalUsage.prompt + finalUsage.completion, for: convID)
                 }
-                let shouldDeliverQueued = store?.queuedMessage?.conversationID == convID
+                let shouldDeliverQueued = !effectiveCancelled && store?.queuedMessage?.conversationID == convID
                 var step = MathFinalStep.keep
                 let messages = store?.conversations.first(where: { $0.id == convID })?.messages
-                if wasAgentTurn, !wasCancelled, !didReportError {
+                if wasAgentTurn, !effectiveCancelled, !didReportError {
                     if let meta = finalMeta, meta["version"] as? Int == 1, let outcome = meta["outcome"] as? String {
                         AppLog.chat.notice("agent turn \(outcome, privacy: .public), \((meta["passes"] as? Int) ?? 0) passes")
                         if let intent = (meta["intent"] as? String).flatMap(MathIntent.init(rawValue:)) {
@@ -1489,7 +1603,7 @@ final class ChatStore: ObservableObject {
                         step = MathGrounding.step(messages: messages, answer: answer, closing: nil, finalizing: true,
                                                   regrounded: true, required: store?.lastMathIntent?.requiresTools ?? true)
                     }
-                } else if !wasCancelled, !didReportError, !shouldDeliverQueued, finalToolCalls.isEmpty, let messages {
+                } else if !effectiveCancelled, !didReportError, !shouldDeliverQueued, finalToolCalls.isEmpty, let messages {
                     step = MathGrounding.step(messages: messages, answer: answer, closing: closing,
                                               finalizing: agentRun?.finalizing == true,
                                               regrounded: agentRun?.regrounded == true, required: mathRequired)
@@ -1531,7 +1645,7 @@ final class ChatStore: ObservableObject {
                 }
                 if shouldDeliverQueued {
                     if !finalToolCalls.isEmpty { store?.interruptPendingToolCalls(conversation: convID) }
-                } else if !wasCancelled && !didReportError && !finalToolCalls.isEmpty {
+                } else if !effectiveCancelled && !didReportError && !finalToolCalls.isEmpty {
                     store?.beginToolPermissions(conversation: convID, context: nextAgentRun)
                 } else if let followUp, let index = store?.conversations.firstIndex(where: { $0.id == convID }) {
                     store?.agentContext = followUp
@@ -1542,19 +1656,39 @@ final class ChatStore: ObservableObject {
                     store?.agentContext = nil
                     store?.compactIfNeeded(conversation: convID, port: port)
                 }
-                return (shouldDeliverQueued, followUp != nil)
+                var startedSaveTask: Task<Void, Never>?
+                if !effectiveCancelled && !didReportError && hasVisibleAnswer && followUp == nil && !shouldDeliverQueued,
+                   let store, store.streamSequence == streamID, store.callbackSequence == cbID,
+                   store.conversations.contains(where: { $0.id == convID }) {
+                    let saveTask = Task { @MainActor [weak store] in
+                        await store?.saveSlot(convID: convID, port: port)
+                        guard let store else { return }
+                        if store.slotSaveStreamID == streamID {
+                            store.slotSaveTask = nil
+                        }
+                        if !store.conversations.contains(where: { $0.id == convID }),
+                           !store.headless || store.slotCacheDirectory != nil {
+                            try? FileManager.default.removeItem(
+                                at: store.activeSlotCacheDir.appendingPathComponent(Self.slotFile(convID)))
+                        }
+                    }
+                    store.slotSaveTask = saveTask
+                    store.slotSaveStreamID = streamID
+                    startedSaveTask = saveTask
+                }
+                return (startedSaveTask, shouldDeliverQueued)
             }
             // Persist the conversation's KV after a real answer, so reopening it
             // (or restarting the engine) skips re-prefilling the history.
-            if !wasCancelled && !didReportError && hasVisibleAnswer && !followed {
-                await self?.saveSlot(convID: convID, port: port)
-            }
+            await saveTask?.value
             if shouldDeliverQueued {
                 await MainActor.run {
+                    guard store?.streamSequence == streamID, store?.callbackSequence == cbID else { return }
                     store?.deliverQueuedMessage(conversation: convID, context: nextAgentRun)
                 }
             }
             pump.cancel()
+            await MainActor.run { store?.finishedStreamTaskCount &+= 1 }
         }
     }
 
@@ -1586,8 +1720,11 @@ final class ChatStore: ObservableObject {
         generatingConvID = nil
         live.reset()
         task = nil
+        pumpTask?.cancel()
+        pumpTask = nil
         watchdog?.cancel()
         watchdog = nil
+        activeStreamGate = nil
         save()
     }
 
@@ -1860,7 +1997,7 @@ final class ChatStore: ObservableObject {
 
     /// Read live from defaults so toggling it in Settings takes effect next turn.
     nonisolated var slotPersistEnabled: Bool {
-        guard !headless else { return false }
+        guard !headless || slotCacheDirectory != nil else { return false }
         let d = UserDefaults.standard
         guard d.bool(forKey: SettingsKeys.persistCache) else { return false }
         guard d.object(forKey: SettingsKeys.faAmd) as? Bool ?? ServerSettings.defaultFaAmd else { return false }
@@ -1874,28 +2011,65 @@ final class ChatStore: ObservableObject {
 
     /// POST /slots/0?action=save|restore (best-effort; a missing file on restore
     /// just means a cold prefill, which is harmless).
-    nonisolated private func slotAction(_ action: String, convID: UUID, port: Int) async {
-        guard var comps = URLComponents(string: "http://127.0.0.1:\(port)/slots/0") else { return }
+    @discardableResult
+    nonisolated private func slotAction(_ action: String, convID: UUID, port: Int) async -> Bool {
+        guard var comps = URLComponents(string: "http://127.0.0.1:\(port)/slots/0") else { return false }
         comps.queryItems = [URLQueryItem(name: "action", value: action)]
-        guard let url = comps.url else { return }
-        var req = URLRequest(url: url)
+        guard let url = comps.url else { return false }
+        var req = URLRequest(url: url, timeoutInterval: 30)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let key = ServerSettings.activeAPIKey() {
             req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
         }
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["filename": Self.slotFile(convID)])
-        _ = try? await URLSession.shared.data(for: req)
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return (200..<300).contains(http.statusCode)
     }
 
     /// Before a turn: if slot 0 doesn't already hold this conversation, restore
     /// its persisted KV so only the new tokens get prefilled.
     func prepareSlot(convID: UUID, port: Int) async {
-        guard slotPersistEnabled, slotConvID != convID else { return }
+        if slotSaveTask != nil || slotRestoreTask != nil {
+            awaitingSlotPreparation = true
+            defer { awaitingSlotPreparation = false }
+            while slotSaveTask != nil || slotRestoreTask != nil {
+                if let save = slotSaveTask {
+                    let saveID = slotSaveStreamID
+                    await save.value
+                    if slotSaveStreamID == saveID { slotSaveTask = nil }
+                }
+                if let restore = slotRestoreTask {
+                    let restoreID = slotRestoreSequence
+                    _ = await restore.value
+                    if slotRestoreSequence == restoreID { slotRestoreTask = nil }
+                }
+                if Task.isCancelled { return }
+            }
+        }
+        guard !Task.isCancelled, slotPersistEnabled, slotConvID != convID else { return }
         // No file yet (new conversation or KV layout change): skip the failing restore.
-        let file = ServerSettings.primarySlotCacheDir.appendingPathComponent(Self.slotFile(convID))
+        let file = activeSlotCacheDir.appendingPathComponent(Self.slotFile(convID))
         guard FileManager.default.fileExists(atPath: file.path) else { slotConvID = convID; return }
-        await slotAction("restore", convID: convID, port: port)
+        // Reset slotConvID before mutating slot 0 on the server so a cancelled or failed
+        // restore never leaves the previous conversation marked as resident.
+        slotConvID = nil
+        slotRestoreSequence &+= 1
+        let restoreID = slotRestoreSequence
+        let restoreTask = Task { [weak self] () -> Bool in
+            guard let self else { return false }
+            let ok = await self.slotAction("restore", convID: convID, port: port)
+            if self.slotRestoreSequence == restoreID {
+                self.slotRestoreTask = nil
+            }
+            return ok
+        }
+        slotRestoreTask = restoreTask
+        let ok = await restoreTask.value
+        if slotRestoreSequence == restoreID { slotRestoreTask = nil }
+        guard !Task.isCancelled, slotPersistEnabled, ok,
+              conversations.contains(where: { $0.id == convID }) else { return }
         slotConvID = convID
     }
 
@@ -1908,7 +2082,7 @@ final class ChatStore: ObservableObject {
     /// Drop slot files with no matching conversation (deleted while disabled, or
     /// left over). Bounds disk use to the conversations that still exist.
     private func pruneOrphanSlots() {
-        let dir = ServerSettings.primarySlotCacheDir
+        let dir = activeSlotCacheDir
         guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
         let ids = Set(conversations.map { $0.id.uuidString })
         for f in files where f.pathExtension == "bin" {
@@ -1922,12 +2096,12 @@ final class ChatStore: ObservableObject {
 
     // MARK: stall watchdog
 
-    private func startWatchdog(_ stream: StreamBuffer) {
+    private func startWatchdog(_ stream: StreamBuffer, streamID: UInt64) {
         watchdog?.cancel()
         watchdog = Task { [weak self] in
             while true {
                 try? await Task.sleep(for: .seconds(5))
-                guard let self, !Task.isCancelled, self.generating else { return }
+                guard let self, !Task.isCancelled, self.generating, self.streamSequence == streamID else { return }
                 if stream.stalled() {
                     self.handleStreamStall(reason: stream.stallReport())
                     return
@@ -1938,19 +2112,37 @@ final class ChatStore: ObservableObject {
 
     /// The engine stopped producing tokens while alive: treat it as a driver
     /// deadlock, stop the engine to free its memory, and tell the user.
-    private func handleStreamStall(reason: String) {
+    func handleStreamStall(reason: String) {
         AppLog.chat.error("stream stalled, \(reason, privacy: .public); stopping engine")
+        slotSaveTask?.cancel()
+        slotSaveTask = nil
+        slotRestoreTask?.cancel()
+        slotRestoreTask = nil
+        slotConvID = nil
+        streamSequence &+= 1
+        callbackSequence &+= 1
         task?.cancel()
         task = nil
+        pumpTask?.cancel()
+        pumpTask = nil
+        watchdog?.cancel()
         watchdog = nil
-        ServerManager.shared.active.note("the chat stopped the engine: \(reason)")
-        ServerManager.shared.active.stop()
+        _ = activeStreamGate?.cancel()
+        activeStreamGate = nil
+        if let id = generatingConvID, queuedMessage?.conversationID == id {
+            queuedMessage = nil
+        }
+        stopStalledEngine(reason)
         lastError = Self.stallMessage(moe: ServerSettings.modelIsMoE(
             at: UserDefaults.standard.string(forKey: SettingsKeys.modelPath) ?? ""))
-        generating = false
-        generatingConvID = nil
-        live.reset()
-        save()
+        if let id = generatingConvID {
+            finish(conversation: id, text: "", speed: nil)
+        } else {
+            generating = false
+            generatingConvID = nil
+            live.reset()
+            save()
+        }
     }
 
     nonisolated static func stallMessage(moe: Bool) -> String {
@@ -2534,12 +2726,9 @@ final class ChatStore: ObservableObject {
                      "The model finished reasoning without a visible answer; regenerate or turn Reasoning off.")
     }
 
-    func stop() {
-        watchdog?.cancel()
-        watchdog = nil
-        task?.cancel()
-        if let stream = activeStream, let url = ChatStreamIdentity.stopURL(port: stream.port, identity: stream.identity) {
-            activeStream = nil
+    nonisolated private static func dispatchEngineStop(for gate: StreamLaunchGate) {
+        if let stream = gate.cancel(),
+           let url = ChatStreamIdentity.stopURL(port: stream.port, identity: stream.identity) {
             var req = URLRequest(url: url)
             req.httpMethod = "DELETE"
             req.timeoutInterval = 5
@@ -2547,6 +2736,22 @@ final class ChatStore: ObservableObject {
                 req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
             }
             Task.detached { _ = try? await URLSession.shared.data(for: req) }
+        }
+    }
+
+    func stop() {
+        callbackSequence &+= 1
+        if let id = generatingConvID, queuedMessage?.conversationID == id {
+            queuedMessage = nil
+        }
+        watchdog?.cancel()
+        watchdog = nil
+        pumpTask?.cancel()
+        pumpTask = nil
+        task?.cancel()
+        if let gate = activeStreamGate {
+            activeStreamGate = nil
+            Self.dispatchEngineStop(for: gate)
         }
     }
 
